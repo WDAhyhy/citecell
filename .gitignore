@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+build/
+dist/
+
+# Node / web
+node_modules/
+web/dist/
+
+# Secrets and local config — never commit
+.env
+.env.*
+*.key
+*.pem
+*.token
+.secrets/
+secrets/
+cookies*.txt
+
+# Third-party documents and model weights are NOT redistributed in this repo
+data/raw/
+data/downloads/
+data/private/
+models/
+*.gguf
+*.safetensors
+*.bin
+
+# Local run outputs (keep run manifests + result tables via explicit paths instead)
+outputs/
+logs/
+*.log
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
