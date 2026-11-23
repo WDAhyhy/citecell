@@ -1,7 +1,7 @@
 """Writer 注册表：按格式字符串懒加载写出函数。
 
 每个写出模块暴露 ``write(ir: DocIR) -> tuple[bytes, list[Placement]]``。
-pdf 条目指向 T5b 的 pdf_writer；T5a 不实现它，因此未安装时报出明确错误。
+pdf 条目指向 T5b 的 pdf_writer（仅在无法导入时报 NotImplementedError）。
 """
 
 from __future__ import annotations

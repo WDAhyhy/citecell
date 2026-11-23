@@ -8,7 +8,7 @@
 已知限制（M1）：
 * XLSX 版面只有一张"项目｜内容"表；table_style 与 cross_block_rate 不作用于 XLSX；
 * XLSX 的值表面形式由 XLSX_TEXT_V1 决定，surface_variety 只作用于字符串型单元格；
-* 不实现 SelfCheck（回读解析器）；PDF 写出见 T5b。
+* 不实现 SelfCheck（回读解析器）；PDF 写出由 T5b 的 pdf_writer 提供（与 DOCX 共用块形状）。
 """
 
 from citecell.synth.generator import GENERATOR_VERSION, ProcurementGenerator, generate

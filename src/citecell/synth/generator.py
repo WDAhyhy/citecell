@@ -7,8 +7,8 @@
 确定性：每份文档的随机源由 (seed, 样本序号) 通过 SHA-256 派生，互不影响；
 同一 GenerationConfig 运行两次，文件字节与 gold.json 字节均相同（见 tests/synth）。
 
-未覆盖（属于后续任务）：ARCH §10 的 SelfCheck（用被测解析器回读）未在 T5a 实现；
-PDF 写出由 T5b 提供。
+PDF 写出由 T5b 的 pdf_writer 提供（DOCX 形状的 IR，PdfLocator 记账）。
+未覆盖：ARCH §10 的 SelfCheck（用被测解析器回读）尚未实现。
 """
 
 from __future__ import annotations

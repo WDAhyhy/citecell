@@ -79,7 +79,7 @@ class Placement:
 
 def block_signature(ir: DocIR) -> tuple:
     """块结构签名：用于比较不同 layout 的文档结构是否不同。"""
-    if ir.fmt != "docx":
+    if ir.fmt == "xlsx":
         return ("sheet", len(ir.rows))
     sig: list[tuple] = []
     for blk in ir.blocks:

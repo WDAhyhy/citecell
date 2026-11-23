@@ -310,9 +310,14 @@ def build_ir(facts: dict[str, Any], keyset: KeySet, diff: DifficultyConfig, rng:
     """事实表 → DocIR。所有随机性来自 ``rng``。"""
     if diff.conflict_rate > 0 or diff.derived_rate > 0:
         raise ValueError("M1 生成器不支持 conflict_rate / derived_rate > 0（属于 M3）")
-    if fmt not in ("docx", "xlsx"):
-        raise ValueError(f"build_ir 不支持格式 {fmt!r}（PDF 由 T5b 提供）")
-    builder = _Builder(rng, diff, keyset, fmt)
-    ir = builder.build_docx(facts) if fmt == "docx" else builder.build_xlsx(facts)
+    if fmt not in ("docx", "xlsx", "pdf"):
+        raise ValueError(f"build_ir 不支持格式 {fmt!r}")
+    # PDF 与 DOCX 共用同一块形状（pdf_writer 接受 ir.fmt 为 "docx" 或 "pdf"），仅标记格式不同。
+    builder = _Builder(rng, diff, keyset, "xlsx" if fmt == "xlsx" else "docx")
+    if fmt == "xlsx":
+        ir = builder.build_xlsx(facts)
+    else:
+        ir = builder.build_docx(facts)
+        ir.fmt = fmt
     ir.spans = builder.spans
     return ir
