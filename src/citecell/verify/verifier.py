@@ -38,6 +38,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from collections.abc import Callable
 from dataclasses import dataclass
 
@@ -217,6 +218,62 @@ class _Draft:
     crossing_note: str = ""
     negated: bool = False
     negated_note: str = ""
+    unit_source: str | None = None
+
+
+#: 纯数字金额文本：只含数字、千分位逗号与小数点（不含货币符号或单位字）。
+_PURE_NUMBER = re.compile(r"(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?")
+#: 表头中的金额单位标记（长的在前，避免“万元”被拆成“元”）。
+_UNIT_MARKERS = re.compile(r"亿元|百万元|万元|千元|元")
+_NUMBER_FORMAT_CNY = ("¥", "￥", "元", "CNY")
+
+
+def _table_unit(block: Block, headers: list[str]) -> tuple[str, str] | None:
+    """表格单元格的金额单位来源：(单位字, 来源说明)；无线索或线索冲突时返回 None（不猜测）。
+
+    ``headers`` 为该单元格上方的全部表头文本（多级表头；由 _Ctx.header_texts 收集）。
+    1. 表头中的单位标记；恰好一种单位 → 采用，来源“列表头”；多种 → None。
+    2. 没有表头单位时，XLSX 单元格数字格式含 ¥/￥/元/CNY → (“元”, “单元格数字格式”)。
+    """
+    if block.table is None:
+        return None
+    words: set[str] = set()
+    for header in headers:
+        words.update(m.group(0) for m in _UNIT_MARKERS.finditer(header))
+    if len(words) == 1:
+        return words.pop(), "列表头"
+    if words:
+        return None
+    loc = block.locator
+    if isinstance(loc, XlsxLocator) and loc.number_format and any(t in loc.number_format for t in _NUMBER_FORMAT_CNY):
+        return "元", "单元格数字格式"
+    return None
+
+
+def _header_money(
+    values: ValueNormalizerV1,
+    value_text: str,
+    spec: KeySpec,
+    drafts: list["_Draft"],
+    ctx: "_Ctx",
+) -> tuple[NormalizedValue, tuple[str, str]] | None:
+    """纯数字金额在表格中用表头单位解析：把单位字拼到数字后交给 ``parse_value``（不做金额运算）。
+
+    仅当所有证据块给出同一个单位来源时生效；否则返回 None（保持 VALUE_UNPARSEABLE）。
+    """
+    if spec.value_type != ValueType.MONEY or _PURE_NUMBER.fullmatch(value_text) is None or not drafts:
+        return None
+    units = {ctx.table_unit(d.span.index) for d in drafts}
+    if len(units) != 1:
+        return None
+    unit = next(iter(units))
+    if unit is None:
+        return None
+    try:
+        value = values.parse_value(value_text + unit[0], spec)
+    except (ValueError, ArithmeticError):
+        return None
+    return value, unit
 
 
 @dataclass
@@ -242,7 +299,14 @@ _QUESTION_WINDOW = 3
 
 
 def _check_at(
-    text: str, ctx: _Ctx, index: int, qs: int, qe: int, value: NormalizedValue, spec: KeySpec
+    text: str,
+    ctx: _Ctx,
+    index: int,
+    qs: int,
+    qe: int,
+    value: NormalizedValue,
+    spec: KeySpec,
+    numeric: tuple[str, str] | None = None,
 ) -> _Check:
     """在块文本的 [qs, qe) 这一处出现上检查值（整块上的提及，不随引文截断）。
 
@@ -282,6 +346,21 @@ def _check_at(
             standalone = _standalone_mention(ctx, index, ia, ib, value, spec)
             if standalone is not None:
                 clean_outside.append((ia, ib, standalone))
+
+    # 表格纯数字金额：单元格整格即引文（完整覆盖，无截断），且“单元格数字 + 表头单位”等价于值。
+    if (
+        numeric is not None
+        and not inside
+        and qs == 0
+        and qe == len(text)
+        and _PURE_NUMBER.fullmatch(text) is not None
+    ):
+        try:
+            parsed = ctx.values.parse_value(text + numeric[0], spec)
+        except (ValueError, ArithmeticError):
+            parsed = None
+        if parsed is not None and ctx.values.equivalent(parsed, value, spec):
+            inside = [(qs, qe, None)]
 
     # 兜底：提及识别器可能漏掉无标度的中文数字（如“六个月”）；引文整体解析为等价值，且两端都不拆记号、
     # 没有截断的提及，则引文整体即为值区间。
@@ -381,6 +460,35 @@ class _Ctx:
         self._hidden = [_is_hidden(b) for b in self.blocks]
         self._nt: dict[int, NormalizedText] = {}
         self._mentions: dict[int, list[tuple[int, int, ValueMention]]] = {}
+        # 表格列索引：(table_id, col_index) -> [(row_index, 文本)]，用于收集多级表头。
+        self._columns: dict[tuple[str, int], list[tuple[int, str]]] = {}
+        for b in self.blocks:
+            if b.table is not None:
+                self._columns.setdefault((b.table.table_id, b.table.col_index), []).append(
+                    (b.table.row_index, b.text)
+                )
+
+    def header_texts(self, i: int) -> list[str]:
+        """单元格上方的表头文本：同列中行号更小、且不含数字的单元格（表头通常不含数字，数据行含数字）。
+
+        解析器的 ``column_headers`` 只给出首行表头，因此这里补充文档中同列的其他上方单元格。
+        """
+        block = self.blocks[i]
+        if block.table is None:
+            return []
+        rows = self._columns.get((block.table.table_id, block.table.col_index), [])
+        out: list[str] = []
+        for row, text in sorted(rows):
+            if row < block.table.row_index and not any(ch.isdigit() for ch in text):
+                if text not in out:
+                    out.append(text)
+        for h in block.table.column_headers:
+            if h not in out:
+                out.append(h)
+        return out
+
+    def table_unit(self, i: int) -> tuple[str, str] | None:
+        return _table_unit(self.blocks[i], self.header_texts(i))
 
     def available(self, i: int) -> bool:
         return self._include_hidden or not self._hidden[i]
@@ -647,10 +755,14 @@ class Verifier:
         # 步骤 5：值解析（失败转 needs_review，绝不抛出或猜测）
         value: NormalizedValue | None = None
         value_issues: list[Issue] = []
+        numeric: tuple[str, str] | None = None
         try:
             value = self._values.parse_value(value_text, spec)
         except (ValueError, ArithmeticError):
-            if spec.value_type == ValueType.ENUM:
+            hv = _header_money(self._values, value_text, spec, drafts, ctx)
+            if hv is not None:
+                value, numeric = hv
+            elif spec.value_type == ValueType.ENUM:
                 value_issues.append(_issue(IssueCode.ENUM_OUT_OF_RANGE, Severity.ERROR, "值不在枚举选项中"))
             else:
                 value_issues.append(_issue(IssueCode.VALUE_UNPARSEABLE, Severity.ERROR, "值无法按键的类型解析"))
@@ -659,7 +771,7 @@ class Verifier:
         crossing_any = negated_any = unit_conflict = False
         if value is not None:
             for d in drafts:
-                self._check_draft(d, ctx, value, spec)
+                self._check_draft(d, ctx, value, spec, numeric)
             bearing = [d for d in drafts if d.vstart is not None]
             crossing_any = any(d.crossing for d in drafts)
             negated_any = any(d.negated for d in drafts)
@@ -843,7 +955,13 @@ class Verifier:
 
     # ------------------------------------------------------------ 步骤 5 值检查（唯一的绑定函数）
     @staticmethod
-    def _check_draft(d: _Draft, ctx: _Ctx, value: NormalizedValue, spec: KeySpec) -> None:
+    def _check_draft(
+        d: _Draft,
+        ctx: _Ctx,
+        value: NormalizedValue,
+        spec: KeySpec,
+        numeric: tuple[str, str] | None = None,
+    ) -> None:
         """所有 grounded 路径共用的值检查。对引文在块内的**每一处出现**逐一检查（_check_at）：
 
         * 值区间只取第一处出现（证据的引文区间即第一处），且只能来自第一处；
@@ -853,9 +971,11 @@ class Verifier:
         first = (d.span.start, d.span.end)
         occs = d.span.occ_spans or (first,)
         for a, b in occs:
-            chk = _check_at(text, ctx, d.span.index, a, b, value, spec)
+            chk = _check_at(text, ctx, d.span.index, a, b, value, spec, numeric)
             if chk.vstart is not None and (a, b) == first and d.vstart is None:
                 d.vstart, d.vend, d.mention_unit = chk.vstart, chk.vend, chk.mention_unit
+                if numeric is not None:
+                    d.unit_source = numeric[1]
             if chk.crossing:
                 d.crossing = True
                 d.crossing_note = d.crossing_note or chk.crossing_note
@@ -915,6 +1035,15 @@ class Verifier:
                     IssueCode.VALUE_CROSSES_QUOTE_BOUNDARY,
                     Severity.ERROR,
                     d.crossing_note or "同类表述与引文边界相交，引文可能截断了值",
+                    idx,
+                )
+            )
+        if d.unit_source is not None:
+            out.append(
+                _issue(
+                    IssueCode.UNIT_FROM_HEADER,
+                    Severity.INFO,
+                    f"金额单位来自{d.unit_source}（纯数字单元格，按该单位解析）",
                     idx,
                 )
             )
