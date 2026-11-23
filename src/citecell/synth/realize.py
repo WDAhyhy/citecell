@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import datetime as _dt
 import random
+from decimal import Decimal
 from typing import Any
 
 from citecell.models import (
@@ -26,8 +27,9 @@ from citecell.models import (
     NumberValue,
     PercentValue,
     TextValue,
+    ValueType,
 )
-from citecell.synth.ir import DocIR, ParaIR, Seg, SheetRow, Span, TableIR
+from citecell.synth.ir import DocIR, ParaIR, Seg, SheetData, SheetRow, Span, TableIR
 from citecell.synth.sampler import ABSENT, make_distractors
 from citecell.synth.surface import (
     amount_to_uppercase,
@@ -52,6 +54,14 @@ FILLER_TEXTS = (
 )
 _TITLE = "采购合同"
 _SENTENCES_PER_PARAGRAPH = 3
+# 金额明细表的表头单位（键为需要独立明细表的金额形式）
+_DETAIL_UNIT = {"header_yuan": "（元）", "header_wanyuan": "（万元）", "currency_format": ""}
+
+
+def _wan_exact(amount: Decimal) -> bool:
+    """金额换算为万元后能否用至多 2 位小数精确表示。"""
+    wan = amount / Decimal(10000)
+    return wan == wan.quantize(Decimal("0.01"))
 
 
 class _Builder:
@@ -66,9 +76,11 @@ class _Builder:
         self._sid = 0
 
     # ------------------------------------------------------------------ 值出现
-    def span(self, key: str, role: str, value: Any) -> Span:
+    def span(self, key: str, role: str, value: Any, form: str | None = None) -> Span:
         self._sid += 1
-        if self.fmt == "xlsx":
+        if self.fmt == "xlsx" and isinstance(value, MoneyValue):
+            cell_value, nf, surface, tags = self._xlsx_money(value, form or "bare_plain")
+        elif self.fmt == "xlsx":
             cell_value, nf, surface, tags = self._xlsx_cell(self.specs[key], value)
         else:
             cell_value, nf = None, None
@@ -166,6 +178,44 @@ class _Builder:
         else:
             raise TypeError(f"未知值类型: {type(value).__name__}")
         return cell, nf, xlsx_cell_text(cell, nf), ("xlsx_cell",)
+
+    def _money_form(self, value: MoneyValue) -> str:
+        """金额单元格的表面形式。surface_variety 决定是否偏离默认的裸数字形式。"""
+        alt = self.rng.random() < self.diff.surface_variety
+        if not alt:
+            return "bare_plain"
+        options = ["header_yuan", "currency_format", "text_yuan"]
+        if _wan_exact(value.amount):
+            options.append("header_wanyuan")
+        return self.rng.choice(options)
+
+    def _xlsx_money(self, value: MoneyValue, form: str) -> tuple[Any, str | None, str, tuple[str, ...]]:
+        """金额的 XLSX 单元格形式（金标准 value 始终为以元计的精确金额）。
+
+        bare_plain      纯数字，表头无单位（主表默认形式）
+        header_yuan     纯数字，表头为"键名（元）"（金额明细表）
+        header_wanyuan  纯数字，表头为"键名（万元）"，单元格为万元数（仅当恰能用至多 2 位小数表示）
+        currency_format 纯数字，单元格数字格式 ¥#,##0.00，表头不带单位（金额明细表）
+        text_yuan       字符串，如 "1345200元"（主表）
+        """
+        amt = value.amount
+        if form == "text_yuan":
+            cell: Any = format(amt.normalize(), "f") + "元"
+            return cell, None, cell, ("surface=text_money_yuan",)
+        if form == "header_wanyuan":
+            wan = amt / Decimal(10000)
+            cell = int(wan) if wan == wan.to_integral_value() else float(wan)
+            nf = None
+        else:
+            cell = int(amt) if amt == amt.to_integral_value() else float(amt)
+            nf = "¥#,##0.00" if form == "currency_format" else None
+        tag = {
+            "bare_plain": "surface=bare_money_plain",
+            "header_yuan": "surface=bare_money_header_yuan",
+            "header_wanyuan": "surface=bare_money_header_wanyuan",
+            "currency_format": "surface=bare_money_currency_format",
+        }[form]
+        return cell, nf, xlsx_cell_text(cell, nf), ("xlsx_cell", tag)
 
     def value_segs(self, key: str, value: Any, dists: list[Any]) -> list[Seg]:
         """DOCX：真值后紧跟括号列出的干扰值，如 "120万元（初报价：100万元）"。"""
@@ -280,6 +330,29 @@ class _Builder:
         return TableIR(rows=rows, merges=merges)
 
     # ------------------------------------------------------------------ XLSX
+    def _detail_sheet(
+        self,
+        spec: KeySpec,
+        facts: dict[str, Any],
+        dists: list[Any],
+        dups: set[str],
+        form: str,
+        hidden: bool,
+    ) -> SheetData:
+        """金额明细表：表头列带单位（或货币格式），真值与干扰值同列同单位。"""
+        key = spec.key
+        unit = _DETAIL_UNIT[form]
+        header = ["项目", f"{key}{unit}", *[f"{lbl}{unit}" for lbl in DISTRACTOR_LABELS[: len(dists)]]]
+        cells: list[Any] = [
+            self.label(key),
+            self.span(key, "value", facts[key], form),
+            *[self.span(key, "distractor", d, form) for d in dists],
+        ]
+        rows = [SheetRow(cells=header), SheetRow(cells=cells, hidden=hidden)]
+        if key in dups:
+            rows.append(SheetRow(cells=[f"{key}（复核）", self.span(key, "value", facts[key], form)]))
+        return SheetData(name=f"{key}明细", rows=rows)
+
     def build_xlsx(self, facts: dict[str, Any]) -> DocIR:
         ir = DocIR(fmt="xlsx", layout=self.layout)
         n = self.diff.distractors_per_key
@@ -291,11 +364,15 @@ class _Builder:
         for spec in present:
             key = spec.key
             hidden = self.rng.random() < self.diff.hidden_row_rate
-            cells: list[Any] = [self.label(key), self.span(key, "value", facts[key])]
-            cells += [self.span(key, "distractor", d) for d in dists[key]]
+            form = self._money_form(facts[key]) if spec.value_type == ValueType.MONEY else None
+            if form in _DETAIL_UNIT:
+                ir.extra_sheets.append(self._detail_sheet(spec, facts, dists[key], dups, form, hidden))
+                continue
+            cells: list[Any] = [self.label(key), self.span(key, "value", facts[key], form)]
+            cells += [self.span(key, "distractor", d, form) for d in dists[key]]
             data.append(SheetRow(cells=cells, hidden=hidden))
             if key in dups:
-                data.append(SheetRow(cells=[f"{key}（复核）", self.span(key, "value", facts[key])]))
+                data.append(SheetRow(cells=[f"{key}（复核）", self.span(key, "value", facts[key], form)]))
         for _ in range(self.diff.filler_blocks):
             pos = self.rng.randint(0, len(data))
             data.insert(pos, SheetRow(cells=[self.filler_text()]))

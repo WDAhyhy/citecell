@@ -57,12 +57,21 @@ class SheetRow:
 
 
 @dataclass
+class SheetData:
+    """附加工作表（如金额明细表）。rows 第 0 行为表头。"""
+
+    name: str
+    rows: list[SheetRow]
+
+
+@dataclass
 class DocIR:
-    fmt: str  # "docx" | "xlsx"
+    fmt: str  # "docx" | "xlsx" | "pdf"
     layout: str  # fixed | perturbed | free
-    blocks: list[ParaIR | TableIR] = field(default_factory=list)  # DOCX
-    sheet_name: str = "采购要素"  # XLSX
-    rows: list[SheetRow] = field(default_factory=list)  # XLSX，第 0 行为表头
+    blocks: list[ParaIR | TableIR] = field(default_factory=list)  # DOCX / PDF
+    sheet_name: str = "采购要素"  # XLSX 主工作表
+    rows: list[SheetRow] = field(default_factory=list)  # XLSX 主表，第 0 行为表头
+    extra_sheets: list[SheetData] = field(default_factory=list)  # XLSX 附加工作表（序号在主表之后）
     spans: list[Span] = field(default_factory=list)  # 所有值出现，按创建顺序
 
 
