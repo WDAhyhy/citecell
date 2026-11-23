@@ -38,9 +38,59 @@ CN_NUMERAL_CHARS = CN_DIGIT_CHARS + "".join(CN_SMALL_UNITS) + "".join(CN_BIG_UNI
 
 # 阿拉伯数字（只用 [0-9]，不用 \d，避免混入其他 Unicode 数字）。
 # 千分位允许逗号或单个空格；小数点只接受 "."。
-NUMERIC = r"(?:[0-9]{1,3}(?:[, ][0-9]{3})+(?:\.[0-9]+)?|[0-9]+(?:\.[0-9]+)?)"
+NUMERIC = r"(?:[0-9]{1,3}(?:,[0-9]{3})+(?:\.[0-9]+)?|[0-9]+(?:\.[0-9]+)?)"
+"""严格数字：千分位仅用逗号，第一组 1–3 位、之后每组恰好 3 位；小数点最多一个。空白不分组。"""
+
+# 仅用于「带货币前缀」的金额（¥/￥/RMB/人民币 之后）：允许空格分组，如 "￥1 234.50"。
+NUMERIC_LOOSE = r"(?:[0-9]{1,3}(?:[, ][0-9]{3})+(?:\.[0-9]+)?|[0-9]+(?:\.[0-9]+)?)"
 
 SCALE: dict[str, Decimal] = {"千": Decimal(1000), "万": Decimal(10**4), "亿": Decimal(10**8)}
+
+_RUN_RE = re.compile(r"[0-9](?:[0-9,.]*[0-9])?")
+_STRICT_RE = re.compile(r"(?:[0-9]{1,3}(?:,[0-9]{3})+|[0-9]+)(?:\.[0-9]+)?")
+
+
+def is_strict_numeric(s: str) -> bool:
+    """s 是否为合法的严格数字（ASCII，逗号千分位，至多一个小数点）。"""
+    return _STRICT_RE.fullmatch(s) is not None
+
+
+def strict_numeric_tokens(text: str) -> list[tuple[int, int, str]]:
+    """扫描文本中的严格数字候选。返回 (start, end, ascii)，坐标为原文坐标（长度与折叠文本一致）。
+
+    规则：
+    - 候选为以数字开头、结尾的最大串（数字、`,`、`.`）。全角逗号 `，` 仅当「前段 1–3 位、后段恰好
+      3 位」时并入千分位，否则在此切开（"5，5" 为两个数字）。
+    - 每个候选整体必须合法，否则整串都不是提及（"12.5.3"、"1,2345" 不产生任何提及）。
+    - 空白从不分组（"1 200" 为两个数字）。
+    """
+    folded = width_fold(text)
+    out: list[tuple[int, int, str]] = []
+    for m in _RUN_RE.finditer(folded):
+        s, e = m.span()
+        cuts: list[int] = []
+        for i in range(s, e):
+            if folded[i] != "," or text[i] != "，":
+                continue
+            j = i - 1
+            while j >= s and folded[j].isdigit():
+                j -= 1
+            left = folded[j + 1 : i]
+            k = i + 1
+            while k < e and folded[k].isdigit():
+                k += 1
+            right = folded[i + 1 : k]
+            # 左段：自上一个分隔符（或串首）起的数字；右段：到下一个分隔符（或串尾）的数字
+            if not (1 <= len(left) <= 3 and len(right) == 3):
+                cuts.append(i)
+        bounds_start = [s] + [c + 1 for c in cuts]
+        bounds_end = cuts + [e]
+        for ps, pe in zip(bounds_start, bounds_end):
+            piece = folded[ps:pe]
+            if is_strict_numeric(piece):
+                out.append((ps, pe, piece))
+    return out
+
 
 def to_decimal(numeric: str) -> Decimal:
     """把 NUMERIC 片段（可含千分位逗号/空格）转换为 Decimal。"""

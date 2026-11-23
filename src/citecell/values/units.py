@@ -12,8 +12,9 @@
 from __future__ import annotations
 
 import re
+from typing import NamedTuple
 
-from citecell.values._common import CN_NUMERAL_CHARS
+from citecell.values._common import CN_NUMERAL_CHARS, width_fold
 
 UNIT_WINDOW = 8
 
@@ -99,3 +100,42 @@ def match_cn_known_unit(folded: str, pos: int) -> tuple[int, str] | None:
         return None
     word = m.group("w1") or m.group("w2")
     return pos + m.end(), canon_unit(word)
+
+
+# 表内规范单位集合：parse_value 只接受这些单位（或键声明的单位本身），
+# 以免「一元化」「五金」中的汉字被当作单位。
+KNOWN_UNITS: frozenset[str] = frozenset(UNIT_CANON.values())
+
+
+class UnitSpan(NamedTuple):
+    """unit_after 的结果。start/end 为原文坐标（与折叠文本等长）；unit 为规范单位。"""
+
+    start: int
+    end: int
+    unit: str
+
+
+def unit_after(text: str, pos: int, *, window: int = UNIT_WINDOW) -> UnitSpan | None:
+    """识别 text[pos:] 中紧随其后的单位。
+
+    - 从 pos 起跳过空白、半角/全角括号、连字符，然后识别单位（表内写法或 1–2 个汉字的表外写法）。
+    - 搜索范围为 pos 起 window 个字符（默认 8）。
+    - 返回 UnitSpan(start=pos, end=单位段终点, unit=规范单位)；text[start:end] 即原文中的单位段
+      （包含跳过的括号和空白）。未识别、或只识别到「个」等无意义前缀时返回 None。
+    - 只识别单位本身，不判断单位与数值是否匹配；冲突判定由调用方（Verifier）完成。
+    - 本函数不改变私有函数 match_unit 的行为。
+    """
+    folded = width_fold(text)
+    limit = min(len(folded), pos + window)
+    j = pos
+    while j < limit and folded[j] in " ()-":
+        j += 1
+    if j >= limit:
+        return None
+    found = match_unit(folded[:limit], j)
+    if found is None:
+        return None
+    end, unit = found
+    if not unit:  # 只有「个」等前缀，没有单位
+        return None
+    return UnitSpan(start=pos, end=end, unit=unit)

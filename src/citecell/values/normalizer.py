@@ -38,10 +38,12 @@ from citecell.models import (
     ValueMention,
 )
 from citecell.values._common import (
+    CN_DIGIT_CHARS,
     CN_NUMERAL_CHARS,
     CN_UNIT_CHARS,
     NUMERIC,
     SCALE,
+    strict_numeric_tokens,
     to_decimal,
     width_fold,
 )
@@ -49,15 +51,14 @@ from citecell.values.dates import find_date_spans, parse_date_text
 from citecell.values.money import find_money_spans, money_value
 from citecell.values.numerals import parse_cn_integer
 from citecell.values.percent import find_percent_spans, parse_percent_text
-from citecell.values.units import canon_unit, match_cn_known_unit, match_unit
+from citecell.values.units import KNOWN_UNITS, canon_unit, match_cn_known_unit, match_unit
 
 _NUMBER_FULL = re.compile(
     rf"^(?P<sign>[-负－])?(?P<body>{NUMERIC}|[{CN_NUMERAL_CHARS}]+)(?P<scale>[千万亿])?(?P<rest>.*)$",
     re.DOTALL,
 )
-_NUMBER_ARABIC_FIND = re.compile(rf"(?<![0-9A-Za-z.,\-/])(?:-)?{NUMERIC}[千万亿]?")
 _NUMBER_CN_RUN_FIND = re.compile(rf"(?<![0-9A-Za-z.,\-/])(?:-|负)?[{CN_NUMERAL_CHARS}]+")
-_UNIT_GENERIC_AFTER = re.compile(r"\s?个?([一-鿿]{1,2})(?![一-鿿])")
+_CN_SPEC_UNIT_AFTER = re.compile(r"\s*\(?\s*(?:个\s*)?{unit}\s*\)?")
 
 
 def _fail(what: str) -> ValueParseError:
@@ -103,7 +104,7 @@ class ValueNormalizerV1:
                 return parse_date_text(s)
             if vt == "number":
                 # 只有键声明了 unit 时才接受数字后的单位文字，否则 "三点五" 会被误判为 3 + 单位"点五"
-                return _parse_number(s, allow_unit=spec.unit is not None)
+                return _parse_number(s, unit_spec=spec.unit)
             if vt == "enum":
                 return EnumValue(value=_match_option(s, spec, "enum"))
             if vt == "boolean":
@@ -169,43 +170,63 @@ class ValueNormalizerV1:
 
     def _find_numbers(self, text: str, spec: KeySpec) -> list[ValueMention]:
         folded = width_fold(text)
-        # 候选：(起点, 数值部分终点, 提及终点, 单位)
-        cands: list[tuple[int, int, int, str | None]] = []
-        for m in _NUMBER_ARABIC_FIND.finditer(folded):
-            end, unit = self._extend_unit(folded, m.end(), spec.unit)
-            cands.append((m.start(), m.end(), end, unit))
+        # 候选：(起点, 提及终点, 数值, 单位)
+        cands: list[tuple[int, int, Decimal, str | None]] = []
+        # 阿拉伯数字：先切出严格数字串（整串合法才算），再接可选的 千/万/亿 倍数与单位
+        for start, num_end, ascii_num in strict_numeric_tokens(text):
+            value = to_decimal(ascii_num)  # 千分位逗号在 to_decimal 中去除
+            end = num_end
+            if num_end < len(folded) and folded[num_end] in SCALE:
+                value *= SCALE[folded[num_end]]
+                end = num_end + 1
+            end, unit = self._extend_unit(folded, end, spec.unit)
+            cands.append((start, end, value, unit))
+        # 中文数字串：需含数字且含单位字（如"十五"），或紧随已知单位（如"六个月""十个月"）。
+        # 只含单位字的串（"千万"）或无单位的普通词（"一般""五金"）不是提及。
         for m in _NUMBER_CN_RUN_FIND.finditer(folded):
             run = m.group(0)
-            has_unit_char = any(ch in CN_UNIT_CHARS for ch in run)
+            body = run.lstrip("-负")
             known = match_cn_known_unit(folded, m.end())
-            if not has_unit_char and not (known and len(run.lstrip("负-")) == 1):
-                continue  # 普通词中的"一"、"二"等不是数字提及
-            if known:
-                cands.append((m.start(), m.end(), known[0], known[1]))
-            else:
-                end, unit = self._extend_unit(folded, m.end(), spec.unit)
-                cands.append((m.start(), m.end(), end, unit))
-
-        mentions: list[ValueMention] = []
-        for start, num_end, end, unit in sorted(cands, key=lambda c: (c[0], -(c[2] - c[0]))):
-            if mentions and start < mentions[-1].end:
-                continue  # 区间重叠：保留先出现且较长者
+            has_digit = any(ch in CN_DIGIT_CHARS for ch in body)
+            has_unit_char = any(ch in CN_UNIT_CHARS for ch in body)
+            if not (known or (has_digit and has_unit_char)):
+                continue
             try:
-                number = _parse_number(text[start:num_end], allow_unit=False)
+                value = _parse_number(text[m.start() : m.end()]).value
             except ValueParseError:
                 continue
-            mentions.append(self._mention(text, start, end, NumberValue(value=number.value, unit=unit)))
+            if known:
+                end, unit = known
+            else:
+                end, unit = self._extend_cn_unit(folded, m.end(), spec.unit)
+            cands.append((m.start(), end, value, unit))
+
+        mentions: list[ValueMention] = []
+        for start, end, value, unit in sorted(cands, key=lambda c: (c[0], -(c[1] - c[0]))):
+            if mentions and start < mentions[-1].end:
+                continue  # 区间重叠：保留先出现且较长者
+            mentions.append(self._mention(text, start, end, NumberValue(value=value, unit=unit)))
         return mentions
 
     @staticmethod
     def _extend_unit(folded: str, end: int, spec_unit: str | None) -> tuple[int, str | None]:
-        """spec.unit 存在时，在窗口内识别紧随数字的单位并并入提及区间。返回 (新 end, 规范单位)。"""
+        """阿拉伯数字：spec.unit 存在时，在窗口内识别紧随数字的单位并并入提及区间。返回 (新 end, 规范单位)。"""
         if not spec_unit:
             return end, None
         found = match_unit(folded, end)
         if found is None:
             return end, None
         return found
+
+    @staticmethod
+    def _extend_cn_unit(folded: str, end: int, spec_unit: str | None) -> tuple[int, str | None]:
+        """中文数字：只接受与 spec.unit 完全相同的单位（不做通用单位猜测，避免"一元化"之类被当作单位）。"""
+        if not spec_unit:
+            return end, None
+        m = re.compile(_CN_SPEC_UNIT_AFTER.pattern.format(unit=re.escape(spec_unit))).match(folded, end)
+        if m is None:
+            return end, None
+        return m.end(), canon_unit(spec_unit)
 
     def _find_options(self, text: str, spec: KeySpec, *, boolean: bool) -> list[ValueMention]:
         if not spec.enum_options:
@@ -233,7 +254,12 @@ class ValueNormalizerV1:
 
 
 # ---------------------------------------------------------------- module level
-def _parse_number(s: str, allow_unit: bool = False) -> NumberValue:
+def _parse_number(s: str, unit_spec: str | None = None) -> NumberValue:
+    """解析数字原文。unit_spec 为键声明的单位（None 表示键没有单位，此时任何后缀都是错误）。
+
+    后缀单位只接受：表内规范单位（KNOWN_UNITS）或 unit_spec 本身。其余后缀（"一元化"中的"元化"、
+    "五金"中的"金"）一律拒绝。
+    """
     t = width_fold(s.strip())
     m = _NUMBER_FULL.match(t)
     if not m:
@@ -250,13 +276,14 @@ def _parse_number(s: str, allow_unit: bool = False) -> NumberValue:
     if m.group("sign"):
         value = -value
     unit: str | None = None
-    rest = m.group("rest")
-    if rest.strip():
-        if not allow_unit:
+    if m.group("rest").strip():
+        if unit_spec is None:
             raise _fail("number")
         found = match_unit(t, m.start("rest"))
         if found is None or found[0] != len(t):
             raise _fail("number")  # 单位必须占满剩余文本
+        if found[1] not in KNOWN_UNITS and found[1] != canon_unit(unit_spec):
+            raise _fail("number")
         unit = found[1]
     return NumberValue(value=value, unit=unit)
 

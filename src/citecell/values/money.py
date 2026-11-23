@@ -20,6 +20,7 @@ from citecell.values._common import (
     CN_DIGITS,
     CN_NUMERAL_CHARS,
     NUMERIC,
+    NUMERIC_LOOSE,
     SCALE,
     to_decimal,
     width_fold,
@@ -35,16 +36,18 @@ _CN_MONEY_FULL = re.compile(
     rf"(?:(?P<fen>零?[{CN_DIGIT_CHARS}])分)?"
     rf"(?P<z>[整正])?$"
 )
-_ARABIC_MONEY_FULL = re.compile(
-    rf"^(?:(?P<pre>{_PREFIX})\s?)?(?P<num>{NUMERIC})(?P<scale>[千万亿])?(?P<suf>[元圆])?(?P<z>[整正])?$"
+# 带前缀：允许空格分组（"￥1 234.50"）；无前缀：严格数字，空白不分组。
+_ARABIC_MONEY_PREFIXED = re.compile(
+    rf"^(?P<pre>{_PREFIX})\s?(?P<num>{NUMERIC_LOOSE})(?P<scale>[千万亿])?(?P<suf>[元圆])?(?P<z>[整正])?$"
 )
+_ARABIC_MONEY_PLAIN = re.compile(rf"^(?P<num>{NUMERIC})(?P<scale>[千万亿])?(?P<suf>[元圆])?(?P<z>[整正])?$")
 
 # 查找用的较宽正则（之后逐个用 parse 验证，失败则丢弃）
 _CN_MONEY_FIND = re.compile(
     rf"(?:{_PREFIX})?[{CN_NUMERAL_CHARS}]+[元圆](?:零?[{CN_DIGIT_CHARS}]角)?(?:零?[{CN_DIGIT_CHARS}]分)?[整正]?"
 )
 _ARABIC_MONEY_FIND = re.compile(
-    rf"(?<![0-9A-Za-z.,\-/])(?:{_PREFIX}\s?)?{NUMERIC}[千万亿]?[元圆]?[整正]?"
+    rf"(?<![0-9A-Za-z.,\-/])(?:(?:{_PREFIX})\s?{NUMERIC_LOOSE}|{NUMERIC})[千万亿]?[元圆]?[整正]?"
 )
 
 
@@ -60,9 +63,9 @@ def parse_money_text(text: str) -> Decimal:
             amount += Decimal(CN_DIGITS[m.group("fen")[-1]]) / 100
         return amount
 
-    m = _ARABIC_MONEY_FULL.match(s)
+    m = _ARABIC_MONEY_PREFIXED.match(s) or _ARABIC_MONEY_PLAIN.match(s)
     if m:
-        if not (m.group("pre") or m.group("suf")):
+        if not (m.groupdict().get("pre") or m.group("suf")):
             raise ValueParseError("缺少金额标记（¥/人民币/元）")
         if m.group("z") and not m.group("suf"):
             raise ValueParseError("整/正 只能跟在 元/圆 之后")
