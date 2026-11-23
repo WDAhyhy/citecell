@@ -13,7 +13,8 @@
 
 页面尺寸：PdfLocator 的 page_width/page_height 取自块的 locator。块跨页时（片段页号与块
 locator 页号不同），尺寸取自块的 locator 页，这是块级数据能提供的最佳近似；M1 的块不跨页，
-该情形只在 Verifier 按页切分后出现。跨页区间由 Verifier 在调用前切分，本类遇到跨页区间会抛 ValueError。
+该情形只在 Verifier 按页切分后出现。跨页区间由 Verifier 在调用前切分；遇到仍跨页的区间，try_locate 返回 None（几何矛盾），
+locate 抛 ValueError。
 """
 
 from __future__ import annotations
@@ -38,9 +39,19 @@ class LocalizerV1:
     version: str = LOCALIZER_VERSION
 
     def locate(self, block: Block, start: int, end: int) -> tuple[Locator, LocatorPrecision]:
-        """返回 ``[start, end)`` 在 ``block`` 中的定位。调用方须保证 ``0 <= start < end <= len(block.text)``。"""
+        """返回 ``[start, end)`` 在 ``block`` 中的定位。区间非法或几何矛盾时抛 ValueError。
+
+        Verifier 使用 ``try_locate``（从不抛出）；本方法供直接调用者使用。
+        """
+        result = self.try_locate(block, start, end)
+        if result is None:
+            raise ValueError("定位区间非法或与块几何矛盾")
+        return result
+
+    def try_locate(self, block: Block, start: int, end: int) -> tuple[Locator, LocatorPrecision] | None:
+        """同 ``locate``，但在区间非法或几何矛盾（如跨页区间）时返回 None，而不抛出异常。"""
         if start < 0 or end <= start or end > len(block.text):
-            raise ValueError("定位区间非法")
+            return None
         loc = block.locator
         if isinstance(loc, PdfLocator):
             return self._locate_pdf(block, loc, start, end)
@@ -48,12 +59,12 @@ class LocalizerV1:
             return loc, LocatorPrecision.CHAR
         if isinstance(loc, XlsxLocator):
             return loc, LocatorPrecision.CELL
-        raise TypeError("不支持的 locator 类型")  # pragma: no cover - 联合类型已穷尽
+        return None  # pragma: no cover - 联合类型已穷尽
 
     # ------------------------------------------------------------------ PDF
     def _locate_pdf(
         self, block: Block, loc: PdfLocator, start: int, end: int
-    ) -> tuple[Locator, LocatorPrecision]:
+    ) -> tuple[Locator, LocatorPrecision] | None:
         block_fallback = (loc, LocatorPrecision.BLOCK)
         overlapping = sorted(
             (f for f in block.fragments if f.start < end and f.end > start),
@@ -63,8 +74,8 @@ class LocalizerV1:
             return block_fallback
         pages = {f.page_number for f in overlapping}
         if len(pages) != 1:
-            # 调用方（Verifier）已按页切分；仍跨页说明调用方违反约定，显式报错而不是猜测。
-            raise ValueError("定位区间跨越多页，应由调用方按页切分")
+            # 调用方（Verifier）已按页切分；若仍跨页则几何矛盾，返回 None 而不猜测。
+            return None
         page = pages.pop()
 
         precision = (

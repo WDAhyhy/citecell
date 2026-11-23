@@ -19,6 +19,7 @@ RETRYABLE_ISSUE_CODES: frozenset[IssueCode] = frozenset(
         IssueCode.QUOTE_FUZZY_ONLY,
         IssueCode.QUOTE_AMBIGUOUS,
         IssueCode.VALUE_NOT_IN_QUOTE,
+        IssueCode.VALUE_CROSSES_QUOTE_BOUNDARY,
         IssueCode.VALUE_UNPARSEABLE,
         IssueCode.ENUM_OUT_OF_RANGE,
         IssueCode.EMPTY_EVIDENCE_WITH_VALUE,
