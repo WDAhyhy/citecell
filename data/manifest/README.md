@@ -19,3 +19,17 @@ Automated downloading of the files is blocked by the site (a JavaScript challeng
 not try to bypass it. Download the files in a browser instead.
 
 Other exchanges were not used because their usage terms could not be found.
+
+## Pointer list with file hashes: `pointer/cninfo_2026-11.jsonl`
+
+30 announcements published on cninfo.com.cn (2026-09 to 2026-11, one per company, found with the keywords
+"重大合同", "中标", "采购合同", "销售合同", "日常经营合同", "框架协议"). Each entry has the source URL, the SHA-256 and
+size of the file as it was downloaded, and the search keyword. **No documents are included.**
+
+- **Terms status:** no usage terms could be found for this site (checked 2026-11-23; there is no robots.txt).
+  The files were downloaded once, in small number and slowly, to a local directory outside this repository,
+  for non-commercial evaluation at the project owner's request. They are not redistributed. Treat the
+  terms as unknown; do not mass-download.
+- The Shanghai Stock Exchange site was **not** used for downloading: its file server answers automated requests
+  with a JavaScript challenge, and this project does not try to get around it.
+- Verification: the hash lets a user who has downloaded the same file check that it is identical.
