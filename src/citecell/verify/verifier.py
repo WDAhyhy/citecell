@@ -192,6 +192,8 @@ class _Span:
     claimed_id: str | None
     noise: bool
     cross: bool
+    occ_spans: tuple[tuple[int, int], ...] = ()
+    """同一块内该引文的全部出现处（升序）；未设置时只有 [start, end) 本身。"""
 
 
 @dataclass(frozen=True)
@@ -212,7 +214,125 @@ class _Draft:
     vend: int | None = None
     mention_unit: str | None = None
     crossing: bool = False
+    crossing_note: str = ""
     negated: bool = False
+    negated_note: str = ""
+
+
+@dataclass
+class _Check:
+    """单处出现的检查结果。"""
+
+    vstart: int | None = None
+    vend: int | None = None
+    mention_unit: str | None = None
+    crossing: bool = False
+    crossing_note: str = ""
+    negated: bool = False
+    negated_note: str = ""
+
+
+#: 符号字符：紧邻引文起点时，表示数值的符号被引文截断（如 “负5”→“5”）。
+_SIGN_CHARS = frozenset("-－−负+＋")
+#: 序数标记：紧邻引文起点时，数量词是序数（如 “第六个月”→“六个月”），不是时长。
+_ORDINAL_CHAR = "第"
+_SIGN_TYPES = frozenset({ValueType.NUMBER, ValueType.MONEY, ValueType.PERCENT})
+_QUESTION_WORD = "是否"
+_QUESTION_WINDOW = 3
+
+
+def _check_at(
+    text: str, ctx: _Ctx, index: int, qs: int, qe: int, value: NormalizedValue, spec: KeySpec
+) -> _Check:
+    """在块文本的 [qs, qe) 这一处出现上检查值（整块上的提及，不随引文截断）。
+
+    * 与引文相交但不完全位于其内、且引文边界拆开了记号 → 截断（crossing）；
+      边界不拆记号时（如“人民币120万元”引为“120万元”）视为外延，若交集本身即等价完整表述则可用。
+    * 完全位于引文内且与值等价的第一个提及 → 值区间与单位。
+    * 值区间存在时的守卫（都判 needs_review）：
+      - 符号或序数（NUMBER/MONEY/PERCENT）：引文起点紧邻符号或“第” → crossing；
+      - 疑问标签（BOOLEAN/ENUM/TEXT）：引文起点前 3 个字符内含“是否” → negated（疑问标签上下文）；
+      - 否定（BOOLEAN/ENUM/TEXT）：引文与提及相交，且起点前紧邻 2 个字符内含否定字 → negated。
+    """
+    chk = _Check()
+    if isinstance(value, TextValue):
+        occ, _ = ctx.find(value.text, index)
+        candidates: list[tuple[int, int, ValueMention | None]] = [(a, b, None) for a, b in occ]
+    else:
+        candidates = list(ctx.mentions(index))
+
+    inside: list[tuple[int, int, ValueMention | None]] = []
+    clean_outside: list[tuple[int, int, ValueMention | None]] = []
+    overlaps = False
+    for a, b, vm in candidates:
+        if not (a < qe and b > qs):
+            continue
+        overlaps = True
+        if qs <= a and b <= qe:
+            if isinstance(value, TextValue) or ctx.values.equivalent(vm.value, value, spec):
+                inside.append((a, b, vm))
+            continue
+        cut_left = a < qs and _token_cut(text, qs)
+        cut_right = b > qe and _token_cut(text, qe)
+        if cut_left or cut_right:
+            chk.crossing = True
+            chk.crossing_note = chk.crossing_note or "同类表述与引文边界相交，引文可能截断了值"
+        else:
+            ia, ib = max(a, qs), min(b, qe)
+            standalone = _standalone_mention(ctx, index, ia, ib, value, spec)
+            if standalone is not None:
+                clean_outside.append((ia, ib, standalone))
+
+    # 兜底：提及识别器可能漏掉无标度的中文数字（如“六个月”）；引文整体解析为等价值，且两端都不拆记号、
+    # 没有截断的提及，则引文整体即为值区间。
+    if (
+        not inside
+        and not clean_outside
+        and not chk.crossing
+        and not isinstance(value, TextValue)
+        and not (_token_cut(text, qs) or _token_cut(text, qe))
+    ):
+        try:
+            parsed = ctx.values.parse_value(text[qs:qe], spec)
+        except (ValueError, ArithmeticError):
+            parsed = None
+        if parsed is not None and ctx.values.equivalent(parsed, value, spec):
+            inside = [(qs, qe, None)]
+            if isinstance(parsed, NumberValue):
+                chk.mention_unit = parsed.unit
+
+    if inside:
+        a, b, vm = inside[0]
+        chk.vstart, chk.vend = a, b
+        if vm is not None and isinstance(vm.value, NumberValue):
+            chk.mention_unit = vm.value.unit
+    elif clean_outside and not chk.crossing:
+        a, b, vm = clean_outside[0]
+        chk.vstart, chk.vend = a, b
+        if vm is not None and isinstance(vm.value, NumberValue):
+            chk.mention_unit = vm.value.unit
+
+    # 守卫（值区间存在时）：符号 / 序数
+    if chk.vstart is not None and spec.value_type in _SIGN_TYPES and qs > 0:
+        prev = text[qs - 1]
+        if prev in _SIGN_CHARS:
+            chk.crossing = True
+            chk.crossing_note = chk.crossing_note or "数值符号被引文边界截断"
+        elif prev == _ORDINAL_CHAR:
+            chk.crossing = True
+            chk.crossing_note = chk.crossing_note or "序数上下文（第…），不是数量或时长"
+
+    # 守卫：疑问标签 / 否定
+    if overlaps and spec.value_type in _NEGATION_TYPES and qs > 0:
+        if _QUESTION_WORD in text[max(0, qs - _QUESTION_WINDOW) : qs]:
+            chk.negated = True
+            chk.negated_note = "疑问标签上下文（引文位于“是否”之后），不能据此判定"
+        else:
+            window = text[max(0, qs - NEGATION_WINDOW) : qs]
+            if any(ch in NEGATION_CHARS for ch in window):
+                chk.negated = True
+                chk.negated_note = "值前紧邻否定字，不能据此判定"
+    return chk
 
 
 def _standalone_mention(
@@ -582,7 +702,11 @@ class Verifier:
                 spans, level = ctx.find(q, claimed)
                 if spans:
                     s0, e0 = spans[0]
-                    return _Outcome(spans=self._finish(ctx, [(claimed, s0, e0)], level, len(spans), False, None, noise))
+                    return _Outcome(
+                        spans=self._finish(
+                            ctx, [(claimed, s0, e0)], level, len(spans), False, None, noise, occ=tuple(spans)
+                        )
+                    )
 
         # 4c：相邻块拼接（跨越边界的命中）
         if claimed is not None:
@@ -687,110 +811,57 @@ class Verifier:
         relocated: bool,
         claimed_id: str | None,
         noise: bool,
+        occ: tuple[tuple[int, int], ...] = (),
     ) -> tuple[_Span, ...]:
-        """按 PDF 页切分原始片段，生成 _Span；多于一段则全部标记 cross。"""
+        """按 PDF 页切分原始片段，生成 _Span；多于一段则全部标记 cross。
+
+        ``occ`` 为同一块内的全部出现处；只有未被切分（单段）时才随 _Span 保留，供逐处守卫检查。
+        """
         split: list[tuple[int, int, int]] = []
         for i, s, e in pieces:
             for ps, pe in _split_pages(ctx.blocks[i], s, e):
                 split.append((i, ps, pe))
         cross = len(split) > 1
-        return tuple(
-            _Span(
-                index=i,
-                start=s,
-                end=e,
-                level=level,
-                occurrences=occurrences,
-                relocated=relocated,
-                claimed_id=claimed_id if relocated else None,
-                noise=noise,
-                cross=cross,
+        out: list[_Span] = []
+        for i, s, e in split:
+            occ_spans = occ if (len(split) == 1 and occ) else ((s, e),)
+            out.append(
+                _Span(
+                    index=i,
+                    start=s,
+                    end=e,
+                    level=level,
+                    occurrences=occurrences,
+                    relocated=relocated,
+                    claimed_id=claimed_id if relocated else None,
+                    noise=noise,
+                    cross=cross,
+                    occ_spans=occ_spans,
+                )
             )
-            for i, s, e in split
-        )
+        return tuple(out)
 
     # ------------------------------------------------------------ 步骤 5 值检查（唯一的绑定函数）
     @staticmethod
     def _check_draft(d: _Draft, ctx: _Ctx, value: NormalizedValue, spec: KeySpec) -> None:
-        """所有 grounded 路径共用的值检查，只在**整块文本**上进行。
+        """所有 grounded 路径共用的值检查。对引文在块内的**每一处出现**逐一检查（_check_at）：
 
-        对每个与引文相交的候选（提及或文本出现）：
-        * 完全位于引文内：若与值等价，取第一个作为值区间（先于其他情形）；
-        * 向外延伸，且引文边界把记号拆开（``_token_cut``）→ ``crossing``，视为截断；
-        * 向外延伸，但边界不拆记号（如“人民币120万元”引为“120万元”）→ 不算截断；
-          若与值等价，值区间取两者交集（仍完全位于引文内）。
-        否定：引文与任一候选相交，且引文起点前紧邻否定字（仅布尔、枚举、文本）→ ``negated``。
+        * 值区间只取第一处出现（证据的引文区间即第一处），且只能来自第一处；
+        * 任一处出现触发截断、符号/序数、疑问标签或否定守卫，整条证据即带相应标记，判 needs_review。
         """
-        s = d.span
-        qs, qe = s.start, s.end
-        text = ctx.text(s.index)
-        if isinstance(value, TextValue):
-            occ, _ = ctx.find(value.text, s.index)
-            candidates: list[tuple[int, int, ValueMention | None]] = [(a, b, None) for a, b in occ]
-        else:
-            candidates = list(ctx.mentions(s.index))
-
-        inside: list[tuple[int, int, ValueMention | None]] = []
-        clean_outside: list[tuple[int, int, ValueMention | None]] = []
-        crossing = False
-        overlaps = False
-        for a, b, vm in candidates:
-            if not (a < qe and b > qs):
-                continue
-            overlaps = True
-            if qs <= a and b <= qe:
-                if isinstance(value, TextValue) or ctx.values.equivalent(vm.value, value, spec):
-                    inside.append((a, b, vm))
-                continue
-            # 向外延伸：判断引文边界是否拆开了记号
-            cut_left = a < qs and _token_cut(text, qs)
-            cut_right = b > qe and _token_cut(text, qe)
-            if cut_left or cut_right:
-                crossing = True
-            else:
-                # 非截断的外延提及：交集必须自身就是一个与值等价的完整表述（如 “人民币120万元”→“120万元”），
-                # 否则只是残片（如 “182万元”→“元”、“百分之五”→“分之五”），不能作为值区间。
-                ia, ib = max(a, qs), min(b, qe)
-                standalone = _standalone_mention(ctx, s.index, ia, ib, value, spec)
-                if standalone is not None:
-                    clean_outside.append((ia, ib, standalone))
-        d.crossing = crossing
-
-        # 兜底：提及识别器可能漏掉无标度的中文数字（如“六个月”），此时若引文本身整体解析为与值等价的
-        # 规范值，且引文两端都不拆记号、没有提及跨越引文边界，则引文整体即为值区间。
-        if (
-            not inside
-            and not clean_outside
-            and not crossing
-            and not isinstance(value, TextValue)
-            and not (_token_cut(text, qs) or _token_cut(text, qe))
-        ):
-            try:
-                parsed = ctx.values.parse_value(text[qs:qe], spec)
-            except (ValueError, ArithmeticError):
-                parsed = None
-            if parsed is not None and ctx.values.equivalent(parsed, value, spec):
-                inside = [(qs, qe, None)]
-                if isinstance(parsed, NumberValue):
-                    d.mention_unit = parsed.unit
-
-        if inside:
-            a, b, vm = inside[0]
-            d.vstart, d.vend = a, b
-            if vm is not None and isinstance(vm.value, NumberValue):
-                d.mention_unit = vm.value.unit
-        elif clean_outside and not crossing:
-            a, b, vm = clean_outside[0]
-            d.vstart, d.vend = a, b
-            if vm is not None and isinstance(vm.value, NumberValue):
-                d.mention_unit = vm.value.unit
-
-        if overlaps and spec.value_type in _NEGATION_TYPES and qs > 0:
-            window = text[max(0, qs - NEGATION_WINDOW) : qs]
-            # “是否”中的“否”是疑问词而非否定（如标签“是否含税”），不计入否定。
-            if window.endswith("是否"):
-                window = window[:-2]
-            d.negated = any(ch in NEGATION_CHARS for ch in window)
+        text = ctx.text(d.span.index)
+        first = (d.span.start, d.span.end)
+        occs = d.span.occ_spans or (first,)
+        for a, b in occs:
+            chk = _check_at(text, ctx, d.span.index, a, b, value, spec)
+            if chk.vstart is not None and (a, b) == first and d.vstart is None:
+                d.vstart, d.vend, d.mention_unit = chk.vstart, chk.vend, chk.mention_unit
+            if chk.crossing:
+                d.crossing = True
+                d.crossing_note = d.crossing_note or chk.crossing_note
+            if chk.negated:
+                d.negated = True
+                d.negated_note = d.negated_note or chk.negated_note
 
     # ------------------------------------------------------------ 步骤 6 构造
     @staticmethod
@@ -840,10 +911,17 @@ class Verifier:
             out.append(_issue(IssueCode.HIDDEN_SOURCE, Severity.WARNING, "证据来自隐藏的 XLSX 单元格", idx))
         if d.crossing:
             out.append(
-                _issue(IssueCode.VALUE_CROSSES_QUOTE_BOUNDARY, Severity.ERROR, "同类表述与引文边界相交，引文可能截断了值", idx)
+                _issue(
+                    IssueCode.VALUE_CROSSES_QUOTE_BOUNDARY,
+                    Severity.ERROR,
+                    d.crossing_note or "同类表述与引文边界相交，引文可能截断了值",
+                    idx,
+                )
             )
         if d.negated:
-            out.append(_issue(IssueCode.NEGATION_CONTEXT, Severity.ERROR, "值前紧邻否定字，不能据此判定", idx))
+            out.append(
+                _issue(IssueCode.NEGATION_CONTEXT, Severity.ERROR, d.negated_note or "值前紧邻否定字，不能据此判定", idx)
+            )
         if has_value and d.vstart is None:
             out.append(
                 _issue(IssueCode.EVIDENCE_WITHOUT_VALUE, Severity.WARNING, "该证据未包含与值等价的完整表述，不计入依据", idx)
