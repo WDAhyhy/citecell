@@ -1,0 +1,23 @@
+{
+  "run_name": "m1_synth_medium",
+  "description": "M1 仿真后端评测：合成中等难度 docx/xlsx/pdf 各 5 份（共 15 份），NoisyOracle 每种注入错误的比例为 0.1（MALFORMED_JSON 为每次调用 0.05）。结果不代表真实模型准确率。",
+  "seed": 1,
+  "n_docs": 15,
+  "formats": ["docx", "xlsx", "pdf"],
+  "keyset": "configs/keysets/procurement_v1.json",
+  "difficulty": "configs/synth/medium.json",
+  "backend": "noisy_oracle",
+  "noisy_ratios": {
+    "wrong_block_id": 0.1,
+    "paraphrased_quote": 0.1,
+    "value_not_in_quote": 0.1,
+    "missing_key": 0.1,
+    "hallucinated_value": 0.1,
+    "distractor_value": 0.1,
+    "cross_block_quote": 0.1,
+    "malformed_json": 0.05
+  },
+  "noisy_seed": 7,
+  "max_semantic_retries": 2,
+  "iou_threshold": 0.5
+}

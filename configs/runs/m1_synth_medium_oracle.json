@@ -1,0 +1,12 @@
+{
+  "run_name": "m1_synth_medium_oracle",
+  "description": "M1 流水线上限：与 m1_synth_medium 相同的语料，使用无注入的 Oracle 仿真后端（完美输出）。结果只说明流水线上限，不代表真实模型准确率。",
+  "seed": 1,
+  "n_docs": 15,
+  "formats": ["docx", "xlsx", "pdf"],
+  "keyset": "configs/keysets/procurement_v1.json",
+  "difficulty": "configs/synth/medium.json",
+  "backend": "oracle",
+  "max_semantic_retries": 2,
+  "iou_threshold": 0.5
+}
