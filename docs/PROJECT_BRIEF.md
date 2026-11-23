@@ -21,10 +21,10 @@ This is an engineering project, not a research paper. Prior work exists (for exa
 - All formats are parsed into **blocks**: stable ID, plain text, and a format-specific locator.
 - The model is asked for `value`, `quote` and `block_id`; it is **not** asked for page numbers or coordinates.
 - The verifier checks block existence, quote ⊂ block text (exact, then normalized), and that the value can be derived from the quote. It computes span offsets and the locator itself.
-- Match levels `exact` / `normalized` / `fuzzy`; `fuzzy` never counts as verified.
+- Match levels `exact` / `normalized` / `fuzzy`; `fuzzy` never counts as `grounded`.
 - Missing key → `null`, no evidence, status `not_found`. No invented values.
 - Derived values carry `evidence` plus an `operation`; the program recomputes the result.
-- Status values: `verified`, `unverified`, `not_found`, `needs_review`.
+- Status values: `grounded`, `derived`, `not_found`, `needs_review`, `failed`. `grounded` means the value is deterministically derivable from a quote that exists in the source — it does **not** mean the value is correct; correctness is judged by evaluation against ground truth or by human review. `failed` marks infrastructure failures, kept separate from content judgments.
 
 ## Layers
 

@@ -42,3 +42,11 @@ logs/
 .DS_Store
 .idea/
 .vscode/
+
+# Regenerable / download caches (annotation manifests live in data/manifest/ and ARE committed)
+data/synthetic/
+data/pointer_cache/
+
+# Training artifacts (training runs on Colab; weights are published elsewhere, not in git)
+training/outputs/
+.ipynb_checkpoints/
