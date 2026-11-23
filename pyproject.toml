@@ -14,6 +14,8 @@ dependencies = [
     "httpx>=0.27",
     "python-docx>=1.1",
     "openpyxl>=3.1",
+    # openpyxl 解析不可信 xlsx 时的 XML 攻击防护（安装后 openpyxl 自动启用）
+    "defusedxml>=0.7",
     # PDF 默认后端（T0 结论见 docs/VERIFICATION_T0.md；默认 pypdfium2）
     "pypdfium2>=4.30",
 ]

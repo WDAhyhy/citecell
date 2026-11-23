@@ -54,7 +54,9 @@ ALIASES: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"\bapache[- ]?(software )?license[- ]?(version )?2\.0|apache-2\.0|apache 2\.0", re.I), "Apache-2.0"),
     (re.compile(r"\bmit\b", re.I), "MIT"),
     (re.compile(r"\bisc\b", re.I), "ISC"),
-    (re.compile(r"\bpsf\b|python software foundation|psf-2\.0|python-2\.0", re.I), "PSF-2.0"),
+    # "PSFL" 是部分包的元数据写法。defusedxml 0.7.1 的 LICENSE 文件经人工核对为
+    # "PYTHON SOFTWARE FOUNDATION LICENSE VERSION 2"，故 PSFL 按 PSF-2.0 处理。
+    (re.compile(r"\bpsf\b|\bpsfl\b|python software foundation|psf-2\.0|python-2\.0", re.I), "PSF-2.0"),
     (re.compile(r"\bbsd[- ]?3|3-clause|new bsd|modified bsd", re.I), "BSD-3-Clause"),
     (re.compile(r"\bbsd[- ]?2|2-clause|simplified bsd|freebsd", re.I), "BSD-2-Clause"),
 ]

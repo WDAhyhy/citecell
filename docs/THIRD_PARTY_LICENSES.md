@@ -8,6 +8,7 @@
 | annotated-types | 0.8.0 | PASS | MIT | MIT | LICENSE<br>annotated_types-0.8.0.dist-info/licenses/LICENSE | 来源:License-Expression |
 | anyio | 4.16.0 | PASS | MIT | MIT | LICENSE<br>anyio-4.16.0.dist-info/licenses/LICENSE | 来源:License-Expression |
 | certifi | 2026.11.20 | WARN | MPL-2.0 | MPL-2.0 | LICENSE<br>certifi-2026.11.20.dist-info/licenses/LICENSE | 需人工批准；来源:License |
+| defusedxml | 0.7.1 | PASS | PSFL | PSF-2.0 | defusedxml-0.7.1.dist-info/LICENSE | 来源:License |
 | et-xmlfile | 2.0.0 | PASS | MIT | MIT | AUTHORS.txt<br>LICENCE.python<br>LICENCE.rst<br>et_xmlfile-2.0.0.dist-info/LICENCE.python<br>et_xmlfile-2.0.0.dist-info/LICENCE.rst | 来源:License |
 | h11 | 0.16.0 | PASS | MIT | MIT | LICENSE.txt<br>h11-0.16.0.dist-info/licenses/LICENSE.txt | 来源:License |
 | httpcore | 1.0.9 | PASS | BSD-3-Clause | BSD-3-Clause | LICENSE.md<br>httpcore-1.0.9.dist-info/licenses/LICENSE.md | 来源:License-Expression |

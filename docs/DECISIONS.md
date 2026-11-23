@@ -36,3 +36,5 @@
 **ADR-016 · 模型分档（cpu-lite / cpu-std / gpu-std / gpu-ref），档位只是 `RunConfig` 预设，不新增代码路径。** 理由：目标用户的普通电脑多数没有 GPU；CPU 的瓶颈是预填充，所以靠"总是先按键预筛选 + 限制每窗口键数 + 小预算"来压缩输入，而不是为 CPU 另写一套流水线。评测按"档位 × 指标"出表。代价：档位取值是初始假设，必须实测校准；CPU 档准确率可能明显低于 GPU 档，由 Verifier 标 `needs_review` 兜底。`RunConfig` 新增三个可选字段（`profile`、`prefilter`、`max_keys_per_window`），默认值不改变原有行为。
 
 **ADR-017 · 模型训练统一在 Colab 上进行，不在本地。** 理由：本地与沙箱没有 GPU；合成数据可由 seed 在 Colab 内重建，避免上传大文件。代价：会话与资源有限，训练脚本必须支持断点续训；GPU 型号与耗时只写实测值；权重不入 git。训练不在 M1 范围内。
+
+**ADR-018 · 依赖许可证的人工批准（2026-11-23，由项目负责人批准）。** ①`certifi`（MPL-2.0，`httpx` 的必需依赖）：仅作为未修改的依赖使用，不影响本仓库的 Apache-2.0；**打包 exe 时必须随附其许可文本**，且不得修改其文件。②`defusedxml`（PSF-2.0，元数据写作 "PSFL"，LICENSE 文件已核对为 PSF License v2）：作为默认依赖，使 openpyxl 在解析不可信 xlsx 时自动启用 XML 攻击防护。③`pypdfium2`（BSD-3-Clause / Apache-2.0，随附 37 份第三方许可文件，其中提到 GPL 的 5 份均为例外条款或构建脚本声明，无任何文件本身是 GPL/LGPL 全文）：打包 exe 时需按其 NOTICE 要求随附全部许可文件；该结论基于抽查，不是法律意见。代价：每新增一个 WARN 级依赖都要重新批准；`check_licenses.py` 对 WARN 仍以退出码 0 通过，批准记录以本条为准。

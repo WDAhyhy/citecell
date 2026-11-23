@@ -52,6 +52,7 @@ def test_pymupdf_not_installed() -> None:
         ("Apache-2.0", "Apache-2.0"),
         ("Apache-2.0 OR BSD-3-Clause", "Apache-2.0"),
         ("PSF-2.0", "PSF-2.0"),
+        ("PSFL", "PSF-2.0"),  # defusedxml 的元数据写法；LICENSE 文件已人工核对为 PSF License v2
         ("GPL-3.0-only", "GPL"),
         ("AGPL-3.0-only", "AGPL"),
         ("LGPL-2.1-or-later", "LGPL"),
