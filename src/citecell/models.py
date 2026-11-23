@@ -259,6 +259,14 @@ class IssueCode(StrEnum):
     UNSUPPORTED_DOCUMENT = "unsupported_document"
     TEXT_LAYER_UNRELIABLE = "text_layer_unreliable"
 
+    # --- 值与引文的边界（独立审查后追加）---
+    VALUE_CROSSES_QUOTE_BOUNDARY = "value_crosses_quote_boundary"
+    """值在整块文本中的完整提及超出了引文边界（引文把数字、日期或词截断了）。可重试：让模型引用完整的值。"""
+    NEGATION_CONTEXT = "negation_context"
+    """引文紧邻的上文含否定词（不/未/非/无/没/否），布尔、枚举或文本值的语义可能相反。"""
+    LOCATOR_ERROR = "locator_error"
+    """定位失败（例如片段几何互相矛盾）。校验器不得因此抛异常，而是降为 needs_review。"""
+
 
 class EvidenceFlag(StrEnum):
     """证据级标记。"""
