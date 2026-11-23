@@ -30,6 +30,9 @@ dev = ["pytest>=8.0"]
 # 可选：AGPL-3.0，不得进入默认安装与 exe；M1 不实现该后端
 pymupdf-agpl = ["PyMuPDF>=1.24"]  # AGPL-3.0 / Artifex 商业双授权
 
+[project.scripts]
+citecell = "citecell.cli:main"
+
 [tool.setuptools.packages.find]
 where = ["src"]
 
