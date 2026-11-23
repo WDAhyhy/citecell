@@ -8,7 +8,8 @@
 * 人工修正（ADR-010）：``Correction`` 以 JSONL 追加写入；导出时只生成单独的修正表，
   绝不改写机器结果。
 
-CSV 与 XLSX 中以 ``= + - @`` 开头的文本（非数字）会加前缀 ``'`` 以防公式注入。
+公式注入防护只在一个出口统一执行：``write_csv`` 与 ``write_xlsx`` 写入每个文本单元格前调用
+``guard_cell``。表格构造函数不做防护，因此新增的列不会漏掉。
 """
 
 from __future__ import annotations
@@ -40,15 +41,27 @@ from citecell.models import (
     XlsxLocator,
 )
 
-_FORMULA_PREFIX = ("=", "+", "-", "@", "\t", "\r")
-_NUMERIC = re.compile(r"^[+-]?[\d,]*\.?\d+(%|元)?$")
+# 可能被电子表格解释为公式的开头字符（ASCII 与全角），以及制表符、回车。
+_FORMULA_START = frozenset("=+-@＝＋－＠")
+_CONTROL_START = ("\t", "\r")
+# 电子表格可能忽略的前导填充字符：零宽字符、BOM、全角空格、不换行空格、ASCII 空格。
+_LEADING_FILLER = "​‌‍⁠﻿　  "
+# 真正的数字（千分位、小数、百分号、"元"）原样输出，不加防护。
+_REAL_NUMBER = re.compile(r"-?(\d{1,3}(,\d{3})+|\d+)(\.\d+)?(%|元)?")
 
-VALUE_HEADER_DOC = "文档"
 
+def guard_cell(text: str) -> str:
+    """公式注入防护（幂等）。
 
-def _guard(text: str) -> str:
-    """防公式注入：可疑前缀且不是纯数字时加单引号。"""
-    if text.startswith(_FORMULA_PREFIX) and not _NUMERIC.match(text):
+    * 纯数字白名单原样返回；
+    * 去掉前导填充字符后以 ``= + - @``（或全角等价字符）开头，或以制表符/回车开头，
+      则在前面加单引号；
+    * 已经带单引号的内容不再加第二个（只有公式型开头才加，而 ``'`` 本身不在该集合中）。
+    """
+    if not text or _REAL_NUMBER.fullmatch(text):
+        return text
+    core = text.lstrip(_LEADING_FILLER)
+    if text.startswith(_CONTROL_START) or (core and core[0] in _FORMULA_START):
         return "'" + text
     return text
 
@@ -106,17 +119,20 @@ def describe_locator(ev: Evidence) -> str:
     return ""  # pragma: no cover
 
 
+VALUE_HEADER_DOC = "文档"
+
+
 def values_table(result: RunResult, keyset: KeySet) -> list[list[str]]:
-    """第一个表：表头 + 每个文档一行。"""
+    """第一个表：表头 + 每个文档一行（未防护，由写出层统一处理）。"""
     header = [VALUE_HEADER_DOC] + [k.key for k in keyset.keys]
     rows = [header]
     for doc in result.documents:
         by_key = {r.key: r for r in doc.records}
         name = doc.info.display_name or doc.info.doc_id
-        row = [_guard(name)]
+        row = [name]
         for k in keyset.keys:
             rec = by_key.get(k.key)
-            row.append(_guard(cell_text(rec)) if rec is not None else "")
+            row.append(cell_text(rec) if rec is not None else "")
         rows.append(row)
     return rows
 
@@ -139,55 +155,43 @@ EVIDENCE_HEADER = [
 
 
 def evidence_table(result: RunResult) -> list[list[str]]:
-    """第二个表：每条证据一行；没有证据的记录也保留一行（证据列为空），以免丢失状态。"""
+    """第二个表：每条证据一行；没有证据的记录保留一行（证据列为空），以免丢失状态。"""
     rows = [list(EVIDENCE_HEADER)]
+    width = len(EVIDENCE_HEADER)
     for doc in result.documents:
         for rec in doc.records:
             codes = ";".join(sorted({i.code.value for i in rec.issues}))
             attempts = ";".join(rec.attempt_ids)
             base = [doc.info.doc_id, rec.key, rec.status.value, format_value(rec.value)]
             if not rec.evidence:
-                rows.append(_guard_row(base + ["", "", "", "", "", "", "", "", attempts, codes]))
+                # 列数 = 表头列数：4 个基础列 + 7 个证据列（空）+ 尝试 + 问题代码。
+                rows.append(base + [""] * 7 + [attempts, codes])
                 continue
             for ev in rec.evidence:
-                rows.append(
-                    _guard_row(
-                        base
-                        + [
-                            ev.block_id,
-                            ev.claimed_block_id or "",
-                            ev.match_level.value,
-                            describe_locator(ev),
-                            ev.quote,
-                            "" if ev.value_char_start is None else str(ev.value_char_start),
-                            "" if ev.value_char_end is None else str(ev.value_char_end),
-                            attempts,
-                            codes,
-                        ]
-                    )
-                )
+                row = base + [
+                    ev.block_id,
+                    ev.claimed_block_id or "",
+                    ev.match_level.value,
+                    describe_locator(ev),
+                    ev.quote,
+                    "" if ev.value_char_start is None else str(ev.value_char_start),
+                    "" if ev.value_char_end is None else str(ev.value_char_end),
+                    attempts,
+                    codes,
+                ]
+                rows.append(row)
+    assert all(len(r) == width for r in rows)
     return rows
 
 
-def _guard_row(row: list[str]) -> list[str]:
-    return [_guard(c) if i in (0, 1, 3, 8) else c for i, c in enumerate(row)]
+CORRECTION_HEADER = ["文档", "键", "动作", "值", "复核者", "时间", "备注"]
 
 
 def correction_table(corrections: Mapping[tuple[str, str], Correction]) -> list[list[str]]:
-    rows = [["文档", "键", "动作", "值", "复核者", "时间", "备注"]]
+    rows = [list(CORRECTION_HEADER)]
     for (doc_id, key), c in sorted(corrections.items()):
         value = c.value_text or format_value(c.value)
-        rows.append(
-            [
-                _guard(doc_id),
-                _guard(key),
-                c.action.value,
-                _guard(value),
-                c.reviewer,
-                c.created_at.isoformat(),
-                _guard(c.note or ""),
-            ]
-        )
+        rows.append([doc_id, key, c.action.value, value, c.reviewer, c.created_at.isoformat(), c.note or ""])
     return rows
 
 
@@ -196,9 +200,9 @@ def write_results_json(result: RunResult, path: Path) -> None:
 
 
 def write_csv(rows: Sequence[Sequence[str]], path: Path) -> None:
-    # utf-8-sig：Excel 直接打开中文不乱码。
+    """写出 CSV。所有文本单元格经 ``guard_cell``（唯一出口）。utf-8-sig 便于 Excel 打开中文。"""
     with path.open("w", encoding="utf-8-sig", newline="") as fh:
-        csv.writer(fh).writerows(rows)
+        csv.writer(fh).writerows([[guard_cell(c) for c in row] for row in rows])
 
 
 def write_xlsx(
@@ -217,8 +221,7 @@ def write_xlsx(
     review_fill = PatternFill("solid", fgColor="FFF2CC")
     failed_fill = PatternFill("solid", fgColor="F4CCCC")
 
-    value_rows = values_table(result, keyset)
-    _write_rows(ws_values, value_rows)
+    _write_rows(ws_values, values_table(result, keyset))
     # 按状态着色：需要按原记录回查状态。
     for r_idx, doc in enumerate(result.documents, start=2):
         by_key = {r.key: r for r in doc.records}
@@ -238,9 +241,10 @@ def write_xlsx(
 
 
 def _write_rows(ws: Any, rows: Sequence[Sequence[str]]) -> None:
+    """写出 XLSX 行。文本经 ``guard_cell``（唯一出口），并全部显式设为字符串类型，
+    使 openpyxl 不把任何内容识别为公式。"""
     for row in rows:
-        ws.append(list(row))
-    # 所有单元格强制按文本存储，避免被当作公式。
+        ws.append([guard_cell(c) if isinstance(c, str) else c for c in row])
     for row in ws.iter_rows():
         for cell in row:
             if isinstance(cell.value, str):
@@ -277,6 +281,7 @@ __all__ = [
     "describe_locator",
     "evidence_table",
     "format_value",
+    "guard_cell",
     "load_corrections",
     "values_table",
     "write_csv",

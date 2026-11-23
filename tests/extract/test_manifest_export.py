@@ -122,7 +122,7 @@ def test_value_display_formats():
 
 
 def test_formula_injection_is_guarded(tmp_path):
-    from citecell.export import _guard
+    from citecell.export import guard_cell as _guard
 
     assert _guard("=HYPERLINK(\"x\")").startswith("'=")
     assert _guard("-1,200元") == "-1,200元"  # 数字样式保持原样
