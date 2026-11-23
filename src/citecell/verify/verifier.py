@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import logging
 import re
+import unicodedata
 from collections.abc import Callable
 from dataclasses import dataclass
 
@@ -70,6 +71,7 @@ from citecell.models import (
 )
 from citecell.textnorm import Matcher, Normalizer
 from citecell.values import ValueNormalizerV1
+from citecell.values.units import UNIT_CANON, match_unit
 from citecell.verify.localizer import LocalizerV1
 from citecell.verify.render_noise import strip_render_noise
 
@@ -84,6 +86,10 @@ FUZZY_MAX_BLOCK_NORM = 2000
 FUZZY_MAX_QUOTE_NORM = 200
 #: 每个候选最多处理的证据条数；超出的证据忽略并附 warning。
 MAX_EVIDENCE_PER_CANDIDATE = 8
+#: 逐处守卫检查的出现次数上限；超过则无法逐处确认，判 needs_review。
+MAX_OCCURRENCES_CHECKED = 20
+#: 单个块文本的字符上限；超过则该块不做校验（判 needs_review）。
+MAX_BLOCK_CHARS = 20000
 #: 否定字：值前紧邻 NEGATION_WINDOW 个字符内出现即视为否定上下文。
 NEGATION_CHARS = frozenset("不未非无没否")
 NEGATION_WINDOW = 2
@@ -219,34 +225,92 @@ class _Draft:
     negated: bool = False
     negated_note: str = ""
     unit_source: str | None = None
+    label_only: bool = False
+    too_many: bool = False
 
 
 #: 纯数字金额文本：只含数字、千分位逗号与小数点（不含货币符号或单位字）。
 _PURE_NUMBER = re.compile(r"(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?")
-#: 表头中的金额单位标记（长的在前，避免“万元”被拆成“元”）。
-_UNIT_MARKERS = re.compile(r"亿元|百万元|万元|千元|元")
-_NUMBER_FORMAT_CNY = ("¥", "￥", "元", "CNY")
+#: 表头中可接受的金额单位（长的在前）。
+_UNIT_ALT = "亿元|百万元|万元|千元|元"
+_UNIT_RE = re.compile(_UNIT_ALT)
+#: 接受的单位位置：整段即单位；括号包住的单位；“单位：”之后的单位。
+_ACCEPTED_UNIT_POS = re.compile(rf"^(?:{_UNIT_ALT})$|[（(]\s*(?:{_UNIT_ALT})\s*[）)]|单位[:：]\s*(?:{_UNIT_ALT})")
+#: 出现即表示“单位相关”的标记（元、百分号、其他币种）。出现在非接受位置时无法确定单位。
+_UNIT_ISH_RE = re.compile(r"元|%|％|美元|美金|港元|欧元|日元|英镑|澳元|加元|法郎|韩元|人民币|RMB|CNY|USD|HKD|EUR|JPY|GBP|¥|￥|\$|€|£")
+#: 表头最长字符数；超过的整句备注不是表头。
+HEADER_MAX_CHARS = 20
+_KNOWN_CURRENCY_UNITS = frozenset({"元", "千元", "万元", "百万元", "亿元"})
+_FORMAT_LITERAL_RE = re.compile(r'"([^"]*)"')
+#: 数字占位符后紧跟的逗号（缩放写法，如 0.0,, 或 0,）。千分位写法 #,##0 不匹配。
+_SCALING_COMMA_RE = re.compile(r"[0#?],+(?![0#?])")
 
 
-def _table_unit(block: Block, headers: list[str]) -> tuple[str, str] | None:
-    """表格单元格的金额单位来源：(单位字, 来源说明)；无线索或线索冲突时返回 None（不猜测）。
+def _header_unit(h: str) -> tuple[str, str | None, bool]:
+    """表头文本的单位判定：返回 (类别, 单位, 是否由隐藏表头贡献)，类别为 unit / neutral / undetermined。
 
-    ``headers`` 为该单元格上方的全部表头文本（多级表头；由 _Ctx.header_texts 收集）。
-    1. 表头中的单位标记；恰好一种单位 → 采用，来源“列表头”；多种 → None。
-    2. 没有表头单位时，XLSX 单元格数字格式含 ¥/￥/元/CNY → (“元”, “单元格数字格式”)。
+    * 不含任何单位相关标记 → neutral（不影响判定）。
+    * 含单位标记：必须恰有一个处于接受位置（括号包住、单位：之后、或整段即单位），且其余部分无单位标记；
+      否则 undetermined（如“千美元”“元/件”“万元以上须审批”）。
+    """
+    if _UNIT_ISH_RE.search(h) is None:
+        return "neutral", None, False
+    acc = _ACCEPTED_UNIT_POS.search(h)
+    if acc is None:
+        return "undetermined", None, False
+    rest = h[: acc.start()] + h[acc.end() :]
+    if _UNIT_ISH_RE.search(rest) is not None:
+        return "undetermined", None, False
+    m = _UNIT_RE.search(acc.group(0))
+    return "unit", (m.group(0) if m else None), False
+
+
+def _format_unit(fmt: str) -> str | None:
+    """XLSX 数字格式中的金额单位。只认：字面量恰为已知单位（如 0"万元"）；或无字面量且含 ¥/￥/CNY/元。
+
+    含其他字面量、或含缩放逗号（0.0,, 之类）的格式不使用。
+    """
+    literals = _FORMAT_LITERAL_RE.findall(fmt)
+    rest = _FORMAT_LITERAL_RE.sub("", fmt)
+    if _SCALING_COMMA_RE.search(rest):
+        return None
+    if literals:
+        if len(literals) == 1 and literals[0] in _KNOWN_CURRENCY_UNITS:
+            return literals[0]
+        return None
+    if any(t in rest for t in ("¥", "￥", "CNY", "元")):
+        return "元"
+    return None
+
+
+def _table_unit(block: Block, headers: list[tuple[str, bool]]) -> tuple[str, str, bool] | None:
+    """表格单元格的金额单位：(单位字, 来源说明, 是否来自隐藏表头)；无线索、线索冲突或无法确定时返回 None。
+
+    ``headers`` 为该单元格上方同一表格区域内的表头文本（文本, 是否隐藏）。
+    1. 任一表头 undetermined → None（不猜测）。
+    2. 表头中的接受单位恰好一种 → (单位, “列表头”)；多种 → None。
+    3. 无表头单位：XLSX 数字格式按 _format_unit 判定 → (单位, “单元格数字格式”)。
     """
     if block.table is None:
         return None
-    words: set[str] = set()
-    for header in headers:
-        words.update(m.group(0) for m in _UNIT_MARKERS.finditer(header))
-    if len(words) == 1:
-        return words.pop(), "列表头"
-    if words:
+    units: set[str] = set()
+    hidden_used = False
+    for text, hidden in headers:
+        kind, unit, _ = _header_unit(text)
+        if kind == "undetermined":
+            return None
+        if kind == "unit" and unit is not None:
+            units.add(unit)
+            hidden_used = hidden_used or hidden
+    if len(units) > 1:
         return None
+    if len(units) == 1:
+        return units.pop(), "列表头", hidden_used
     loc = block.locator
-    if isinstance(loc, XlsxLocator) and loc.number_format and any(t in loc.number_format for t in _NUMBER_FORMAT_CNY):
-        return "元", "单元格数字格式"
+    if isinstance(loc, XlsxLocator) and loc.number_format:
+        fu = _format_unit(loc.number_format)
+        if fu is not None:
+            return fu, "单元格数字格式", False
     return None
 
 
@@ -256,10 +320,10 @@ def _header_money(
     spec: KeySpec,
     drafts: list["_Draft"],
     ctx: "_Ctx",
-) -> tuple[NormalizedValue, tuple[str, str]] | None:
+) -> tuple[NormalizedValue, tuple[str, str], bool] | None:
     """纯数字金额在表格中用表头单位解析：把单位字拼到数字后交给 ``parse_value``（不做金额运算）。
 
-    仅当所有证据块给出同一个单位来源时生效；否则返回 None（保持 VALUE_UNPARSEABLE）。
+    返回 (值, (单位字, 来源), 是否来自隐藏表头)。仅当所有证据块给出同一个单位来源时生效。
     """
     if spec.value_type != ValueType.MONEY or _PURE_NUMBER.fullmatch(value_text) is None or not drafts:
         return None
@@ -273,7 +337,7 @@ def _header_money(
         value = values.parse_value(value_text + unit[0], spec)
     except (ValueError, ArithmeticError):
         return None
-    return value, unit
+    return value, (unit[0], unit[1]), unit[2]
 
 
 @dataclass
@@ -287,6 +351,7 @@ class _Check:
     crossing_note: str = ""
     negated: bool = False
     negated_note: str = ""
+    label_only: bool = False
 
 
 #: 符号字符：紧邻引文起点时，表示数值的符号被引文截断（如 “负5”→“5”）。
@@ -298,36 +363,204 @@ _QUESTION_WORD = "是否"
 _QUESTION_WINDOW = 3
 
 
+#: 应忽略的字符：零宽、软连字符，以及组合标记（由调用方另行判断）。
+_IGNORABLE_CHARS = frozenset("​‌‍⁠﻿­")
+#: 子句分隔符（否定范围不跨越）。
+_CLAUSE_DELIMS = frozenset("。；;，,！!？?\n")
+#: 否定与疑问的子句段边界：句分隔符、冒号、以及括号（括号内是另一层子句）。
+_SEGMENT_DELIMS = _CLAUSE_DELIMS | frozenset("（）()")
+_COLON_CHARS = frozenset("：:")
+_LABEL_TYPES = frozenset({ValueType.BOOLEAN, ValueType.ENUM, ValueType.TEXT})
+_NUMERIC_BOUNDARY_TYPES = frozenset({ValueType.NUMBER, ValueType.MONEY, ValueType.PERCENT, ValueType.DATE})
+_ACCOUNTING_TYPES = frozenset({ValueType.NUMBER, ValueType.MONEY, ValueType.PERCENT})
+_BOUNDARY_SEPARATORS = frozenset(",，.．-/:")
+_HYPHENS_AND_BRACKETS = frozenset("-－‐‑–—()（）")
+_UNCHECKED_BOX = frozenset("□☐")
+#: 上下文向前/向后扫描的字符上限（子句分隔符之外的长文本不做逐字扫描，保证线性耗时）。
+_CLAUSE_SCAN_LIMIT = 200
+_PAREN_LIST_RE = re.compile(r"[（(][^（）()]*[/／][^（）()]*[）)]")
+
+
+def _is_skip(c: str) -> bool:
+    """上下文判断时跳过的字符：空白、零宽/软连字符、组合标记。"""
+    return c.isspace() or c in _IGNORABLE_CHARS or unicodedata.category(c).startswith("M")
+
+
+def _fold(c: str) -> str:
+    """上下文字符的归一化：NFKC（全角→半角等），并把 U+2212 减号折叠为 ASCII 连字符。"""
+    return unicodedata.normalize("NFKC", c).replace("−", "-")
+
+
+def _folded(s: str) -> str:
+    return "".join(_fold(c) for c in s if not _is_skip(c))
+
+
 def _before(text: str, p: int, n: int) -> str:
-    """位置 p 之前的最后 n 个字符，忽略其间的空白（PDF 行连接、版式空格不影响上下文判断）。"""
-    return text[:p].rstrip()[-n:] if n > 0 else ""
+    """位置 p 之前最后 n 个“有效”字符（归一化后，跳过空白、零宽与组合标记）。"""
+    out: list[str] = []
+    for c in reversed(text[:p]):
+        if _is_skip(c):
+            continue
+        out.append(_fold(c))
+        if len(out) >= n:
+            break
+    return "".join(reversed(out))
+
+
+def _after(text: str, q: int, n: int) -> str:
+    """位置 q 之后前 n 个有效字符（归一化后）。"""
+    out: list[str] = []
+    for c in text[q:]:
+        if _is_skip(c):
+            continue
+        out.append(_fold(c))
+        if len(out) >= n:
+            break
+    return "".join(out)
+
+
+def _segment_before(text: str, a: int) -> str:
+    """提及 [a, …) 之前的子句段：向前至子句分隔符或冒号为止（有界扫描）。"""
+    i = a - 1
+    floor = max(-1, a - _CLAUSE_SCAN_LIMIT - 1)
+    while i > floor and text[i] not in _SEGMENT_DELIMS and text[i] not in _COLON_CHARS:
+        i -= 1
+    return text[i + 1 : a]
+
+
+def _segment_after(text: str, b: int) -> str:
+    """提及 […, b) 之后的子句段：向后至子句分隔符或冒号为止（有界扫描）。"""
+    j = b
+    ceil = min(len(text), b + _CLAUSE_SCAN_LIMIT)
+    while j < ceil and text[j] not in _SEGMENT_DELIMS and text[j] not in _COLON_CHARS:
+        j += 1
+    return text[b:j]
+
+
+#: 答案区分隔符：问句“是否…”之后，第一个出现的冒号、“为”或“是”开始答案区。
+_ANSWER_SEPARATORS = frozenset("：:为是")
+
+
+def _in_question_clause(left: str) -> bool:
+    """提及之前的子句段（已归一化）是否处于“是否…”问句中、且尚未进入答案区。
+
+    取最后一个“是否”，其后至提及之间若出现答案区分隔符（冒号、为、是），则已进入答案区，不是问句上下文。
+    """
+    k = left.rfind(_QUESTION_WORD)
+    if k < 0:
+        return False
+    tail = left[k + len(_QUESTION_WORD) :]
+    return not any(ch in _ANSWER_SEPARATORS for ch in tail)
+
+
+def _space_after_label(text: str, ctx: "_Ctx", index: int, a: int) -> bool:
+    """提及 a 之前是否紧跟一次键名/别名出现，且二者之间只有空白（含 PDF 行连接、全角空格）。
+
+    这是第五轮的空白分隔规则：只有键名或别名之后的空白才开启答案区；零宽字符等非空白不算。
+    """
+    for _ka, kb in ctx.key_spans(index):
+        if kb < a and text[kb:a] and text[kb:a].strip() == "":
+            return True
+    return False
 
 
 def _guards(
-    text: str, p: int, spec: KeySpec, overlaps: bool, value_bearing: bool
+    text: str, a: int, b: int, spec: KeySpec, overlaps: bool, value_bearing: bool, space_sep: bool = False
 ) -> tuple[str | None, str | None]:
-    """位置 p（提及或引文的起点）上的守卫，返回 (截断说明或 None, 否定说明或 None)。
+    """提及 [a, b) 上的守卫，返回 (截断说明或 None, 否定说明或 None)。
 
-    * 符号 / 序数（value_bearing 且 NUMBER/MONEY/PERCENT）：紧邻前一个字符是符号 → 截断；是“第” → 序数截断。
-    * 疑问标签 / 否定（overlaps 且 BOOLEAN/ENUM/TEXT）：前 3 字符含“是否” → 疑问标签上下文；
-      前 2 字符含否定字 → 否定上下文。
+    * 符号 / 序数 / 会计括号（value_bearing；NUMBER/MONEY/PERCENT）：紧邻前一个有效字符是符号，或“第”，
+      或提及被圆括号包住（会计负数）→ 截断。
+    * 否定与疑问（overlaps；BOOLEAN/ENUM/TEXT）：提及所在子句段（冒号与句分隔符之间）里，
+      提及之外若含“是否”→疑问标签上下文；含否定字 → 否定上下文。
     """
     crossing_note: str | None = None
     negated_note: str | None = None
-    if p <= 0:
-        return None, None
     if value_bearing and spec.value_type in _SIGN_TYPES:
-        prev = _before(text, p, 1)
+        prev = _before(text, a, 1)
         if prev in _SIGN_CHARS:
             crossing_note = "数值符号被引文边界截断"
         elif prev == _ORDINAL_CHAR:
             crossing_note = "序数上下文（第…），不是数量或时长"
+        elif (
+            spec.value_type in _ACCOUNTING_TYPES
+            and prev == "("
+            and _after(text, b, 1) == ")"
+        ):
+            crossing_note = "括号可能表示负数（会计写法），符号有歧义"
     if overlaps and spec.value_type in _NEGATION_TYPES:
-        if _QUESTION_WORD in _before(text, p, _QUESTION_WINDOW):
-            negated_note = "疑问标签上下文（引文位于“是否”之后），不能据此判定"
-        elif any(ch in NEGATION_CHARS for ch in _before(text, p, NEGATION_WINDOW)):
-            negated_note = "值前紧邻否定字，不能据此判定"
+        left = _folded(_segment_before(text, a))
+        right = _folded(_segment_after(text, b))
+        if not space_sep and _in_question_clause(left):
+            negated_note = "疑问标签上下文（提及位于“是否”之后、答案区之前），不能据此判定"
+        elif any(ch in NEGATION_CHARS for ch in left.replace(_QUESTION_WORD, "") + right):
+            negated_note = "否定字位于值所在子句中（子句级否定），不能据此判定"
     return crossing_note, negated_note
+
+
+def _is_label_candidate(text: str, ctx: "_Ctx", index: int, a: int, b: int, colon_abs: int | None) -> bool:
+    """提及是否位于标签区域（不是值候选）：键名或别名内部、括号内选项列表、未勾选项、冒号之前的标签区。"""
+    for ka, kb in ctx.key_spans(index):
+        if ka <= a and b <= kb:
+            return True
+    for pa, pb in ctx.paren_spans(index):
+        if pa <= a and b <= pb:
+            return True
+    if _before(text, a, 1) in _UNCHECKED_BOX:
+        return True
+    return colon_abs is not None and a < colon_abs
+
+
+def _char_before_skip(text: str, p: int) -> str | None:
+    i = p - 1
+    while i >= 0 and _is_skip(text[i]):
+        i -= 1
+    return text[i] if i >= 0 else None
+
+
+def _char_after_skip(text: str, q: int) -> str | None:
+    j = q
+    while j < len(text) and _is_skip(text[j]):
+        j += 1
+    return text[j] if j < len(text) else None
+
+
+def _quote_cut(text: str, qs: int, qe: int, ctx: "_Ctx", index: int) -> bool:
+    """数字边界截断：引文边缘字符是数字，且紧邻的（跳过空白后的）外侧字符是数字或连接符。
+
+    引文起点在块首时，同页（或带 CONTINUED 标记）的上一块末尾字符也计入。
+    """
+    if qs >= qe:
+        return False
+    inner_first, inner_last = text[qs], text[qe - 1]
+    if inner_first.isdigit():
+        before = _char_before_skip(text, qs)
+        if before is None and qs == 0:
+            before = ctx.prev_tail(index)
+        if before is not None and (before.isdigit() or before in _BOUNDARY_SEPARATORS):
+            return True
+    if inner_last.isdigit():
+        after = _char_after_skip(text, qe)
+        if after is not None and (after.isdigit() or after in _BOUNDARY_SEPARATORS):
+            return True
+    return False
+
+
+def _tail_unit(text: str, q: int) -> str | None:
+    """引文之后紧随的单位（跳过空白、括号与连字符），仅接受 UNIT_CANON 中的规范单位。"""
+    out: list[str] = []
+    j = q
+    while j < len(text) and len(out) < 12:
+        c = text[j]
+        j += 1
+        if _is_skip(c) or c in _HYPHENS_AND_BRACKETS:
+            continue
+        out.append(_fold(c))
+    found = match_unit("".join(out), 0)
+    if found is None:
+        return None
+    unit = found[1]
+    return unit if unit in set(UNIT_CANON.values()) else None
 
 
 def _check_at(
@@ -342,11 +575,10 @@ def _check_at(
 ) -> _Check:
     """在块文本的 [qs, qe) 这一处出现上检查值（整块上的提及，不随引文截断）。
 
-    * 与引文相交但不完全位于其内、且引文边界拆开了记号 → 截断（crossing）；边界不拆记号时，
-      若交集本身即等价完整表述（如“人民币120万元”引为“120万元”）则可作为值区间。
-    * 完全位于引文内且与值等价的提及：**逐个**检查守卫（守卫看每个提及自身的起点），
-      取第一个通过全部守卫的提及作为值区间；全部未通过则取第一个并标记守卫说明（needs_review）。
-    * 其他情形（外延交集、表格整格、截断兜底）的值区间起点为 vstart，守卫在 vstart 上检查。
+    * 标签区域（键名/别名内部、括号选项列表、未勾选项、冒号之前；仅 BOOLEAN/ENUM/TEXT）不是值候选。
+    * 与引文相交但不完全位于其内、且引文边界拆开了记号 → 截断；边界不拆记号时，交集本身若是完整等价表述则可用。
+    * 完全位于引文内且与值等价的提及：逐个检查守卫，取第一个通过全部守卫的提及。
+    * 值区间确定后：守卫在值区间上复核；数字边界截断；引文之后的单位（UNIT_MISMATCH 经 mention_unit 判定）。
     """
     chk = _Check()
     if isinstance(value, TextValue):
@@ -354,17 +586,24 @@ def _check_at(
         candidates: list[tuple[int, int, ValueMention | None]] = [(a, b, None) for a, b in occ]
     else:
         candidates = list(ctx.mentions(index))
+    colon_abs = next((k for k in range(qs, qe) if text[k] in _COLON_CHARS), None)
 
     inside: list[tuple[int, int, ValueMention | None]] = []
     clean_outside: list[tuple[int, int, ValueMention | None]] = []
     overlaps = False
+    label_hit = False
     for a, b, vm in candidates:
         if not (a < qe and b > qs):
             continue
         overlaps = True
         if qs <= a and b <= qe:
-            if isinstance(value, TextValue) or ctx.values.equivalent(vm.value, value, spec):
-                inside.append((a, b, vm))
+            eq = isinstance(value, TextValue) or ctx.values.equivalent(vm.value, value, spec)
+            if not eq:
+                continue
+            if spec.value_type in _LABEL_TYPES and _is_label_candidate(text, ctx, index, a, b, colon_abs):
+                label_hit = True
+                continue
+            inside.append((a, b, vm))
             continue
         cut_left = a < qs and _token_cut(text, qs)
         cut_right = b > qe and _token_cut(text, qe)
@@ -376,15 +615,10 @@ def _check_at(
             standalone = _standalone_mention(ctx, index, ia, ib, value, spec)
             if standalone is not None:
                 clean_outside.append((ia, ib, standalone))
+    chk.label_only = label_hit
 
-    # 表格纯数字金额：单元格整格即引文（完整覆盖，无截断），且“单元格数字 + 表头单位”等价于值。
-    if (
-        numeric is not None
-        and not inside
-        and qs == 0
-        and qe == len(text)
-        and _PURE_NUMBER.fullmatch(text) is not None
-    ):
+    # 表格纯数字金额：单元格整格即引文（完整覆盖），且“单元格数字 + 表头单位”等价于值。
+    if numeric is not None and not inside and qs == 0 and qe == len(text) and _PURE_NUMBER.fullmatch(text) is not None:
         try:
             parsed = ctx.values.parse_value(text + numeric[0], spec)
         except (ValueError, ArithmeticError):
@@ -392,13 +626,15 @@ def _check_at(
         if parsed is not None and ctx.values.equivalent(parsed, value, spec):
             inside = [(qs, qe, None)]
 
-    # 兜底：提及识别器可能漏掉无标度的中文数字（如“六个月”）；引文整体解析为等价值，且两端都不拆记号、
-    # 没有截断的提及，则引文整体即为值区间。
+    # 兜底：引文整体解析为等价值，且引文文本恰好等于值文本、两端不拆记号、没有标签区命中。
     if (
         not inside
         and not clean_outside
         and not chk.crossing
+        and not label_hit
         and not isinstance(value, TextValue)
+        and ctx.value_text is not None
+        and text[qs:qe].strip() == ctx.value_text
         and not (_token_cut(text, qs) or _token_cut(text, qe))
     ):
         try:
@@ -410,48 +646,57 @@ def _check_at(
             if isinstance(parsed, NumberValue):
                 chk.mention_unit = parsed.unit
 
+    # 选择值区间
     if inside:
-        # 逐个提及检查守卫：取第一个通过全部守卫的提及。
         chosen: tuple[int, int, ValueMention | None] | None = None
-        first_bad: tuple[int, int, ValueMention | None, str | None, str | None] | None = None
         for a, b, vm in inside:
-            cn, ng = _guards(text, a, spec, overlaps, True)
+            cn, ng = _guards(text, a, b, spec, overlaps, True, _space_after_label(text, ctx, index, a))
             if cn is None and ng is None:
                 chosen = (a, b, vm)
                 break
-            if first_bad is None:
-                first_bad = (a, b, vm, cn, ng)
-        if chosen is not None:
-            a, b, vm = chosen
-        else:
-            assert first_bad is not None
-            a, b, vm, cn, ng = first_bad
-            if cn is not None:
-                chk.crossing = True
-                chk.crossing_note = chk.crossing_note or cn
-            if ng is not None:
-                chk.negated = True
-                chk.negated_note = ng
+        if chosen is None:
+            chosen = inside[0]  # 全部未通过：取第一个，守卫说明在下方统一记录（needs_review）
+        a, b, vm = chosen
         chk.vstart, chk.vend = a, b
         if vm is not None and isinstance(vm.value, NumberValue):
             chk.mention_unit = vm.value.unit
-        return chk
-
-    if clean_outside and not chk.crossing:
+    elif clean_outside and not chk.crossing:
         a, b, vm = clean_outside[0]
         chk.vstart, chk.vend = a, b
         if vm is not None and isinstance(vm.value, NumberValue):
             chk.mention_unit = vm.value.unit
 
-    # 无内部值区间时：守卫在 vstart（或引文起点）上检查。
-    pos = chk.vstart if chk.vstart is not None else qs
-    cn, ng = _guards(text, pos, spec, overlaps, chk.vstart is not None)
+    if chk.vstart is None:
+        # 无值区间：守卫在引文范围上做标记（否定上下文提示；数字边界截断同样记录）。
+        cn, ng = _guards(text, qs, qe, spec, overlaps, False, _space_after_label(text, ctx, index, qs))
+        if ng is not None:
+            chk.negated, chk.negated_note = True, ng
+        if spec.value_type in _NUMERIC_BOUNDARY_TYPES and _quote_cut(text, qs, qe, ctx, index):
+            chk.crossing = True
+            chk.crossing_note = "数字在引文边界处被截断（相邻数字或连接符）"
+        return chk
+
+    # 值区间已确定：守卫在值区间上复核（全部未通过时在此记录说明）。
+    cn, ng = _guards(
+        text,
+        chk.vstart,
+        chk.vend or chk.vstart,
+        spec,
+        overlaps,
+        True,
+        _space_after_label(text, ctx, index, chk.vstart),
+    )
     if cn is not None:
         chk.crossing = True
         chk.crossing_note = chk.crossing_note or cn
     if ng is not None:
         chk.negated = True
         chk.negated_note = ng
+    if spec.value_type in _NUMERIC_BOUNDARY_TYPES and _quote_cut(text, qs, qe, ctx, index):
+        chk.crossing = True
+        chk.crossing_note = chk.crossing_note or "数字在引文边界处被截断（相邻数字或连接符）"
+    if spec.unit is not None and chk.mention_unit is None:
+        chk.mention_unit = _tail_unit(text, qe)
     return chk
 
 
@@ -501,38 +746,86 @@ class _Ctx:
         self._hidden = [_is_hidden(b) for b in self.blocks]
         self._nt: dict[int, NormalizedText] = {}
         self._mentions: dict[int, list[tuple[int, int, ValueMention]]] = {}
-        # 表格列索引：(table_id, col_index) -> [(row_index, 文本)]，用于收集多级表头。
-        self._columns: dict[tuple[str, int], list[tuple[int, str]]] = {}
-        for b in self.blocks:
+        # 表格单元格索引：table_id -> {row_index: {col_index: 块下标}}，用于向上扫描表头。
+        self._cells: dict[str, dict[int, dict[int, int]]] = {}
+        for i, b in enumerate(self.blocks):
             if b.table is not None:
-                self._columns.setdefault((b.table.table_id, b.table.col_index), []).append(
-                    (b.table.row_index, b.text)
-                )
+                self._cells.setdefault(b.table.table_id, {}).setdefault(b.table.row_index, {})[b.table.col_index] = i
+        self._key_spans: dict[int, list[tuple[int, int]]] = {}
+        self._paren_spans: dict[int, list[tuple[int, int]]] = {}
+        self._long = [len(b.text) > MAX_BLOCK_CHARS for b in self.blocks]
+        self.value_text: str | None = None
 
-    def header_texts(self, i: int) -> list[str]:
-        """单元格上方的表头文本：同列中行号更小、且不含数字的单元格（表头通常不含数字，数据行含数字）。
-
-        解析器的 ``column_headers`` 只给出首行表头，因此这里补充文档中同列的其他上方单元格。
-        """
-        block = self.blocks[i]
-        if block.table is None:
+    def header_cells(self, i: int) -> list[tuple[str, bool]]:
+        """单元格上方同一表格区域内的表头文本（文本, 是否隐藏）：从单元格向上扫描，遇到空行即停止；
+        同列的数值单元格属于同一表格、跳过；只收集不含数字、不超过 HEADER_MAX_CHARS 的文本；隐藏表头仅在
+        include_hidden_cells 为真时参与（available 已处理）。"""
+        t = self.blocks[i].table
+        if t is None:
             return []
-        rows = self._columns.get((block.table.table_id, block.table.col_index), [])
-        out: list[str] = []
-        for row, text in sorted(rows):
-            if row < block.table.row_index and not any(ch.isdigit() for ch in text):
-                if text not in out:
-                    out.append(text)
-        for h in block.table.column_headers:
-            if h not in out:
-                out.append(h)
+        rows = self._cells.get(t.table_id, {})
+        out: list[tuple[str, bool]] = []
+        r = t.row_index - 1
+        while r >= 0:
+            if r not in rows:
+                break  # 空行：表头扫描不跨越空行
+            j = rows[r].get(t.col_index)
+            if j is not None and self.available(j):
+                b = self.blocks[j]
+                txt = b.text.strip()
+                if txt and not any(ch.isdigit() for ch in txt) and len(txt) <= HEADER_MAX_CHARS:
+                    out.append((txt, _is_hidden(b)))
+            r -= 1
         return out
 
-    def table_unit(self, i: int) -> tuple[str, str] | None:
-        return _table_unit(self.blocks[i], self.header_texts(i))
+    def table_unit(self, i: int) -> tuple[str, str, bool] | None:
+        return _table_unit(self.blocks[i], self.header_cells(i))
+
+    def key_spans(self, i: int) -> list[tuple[int, int]]:
+        """键名与别名在块文本中每次出现的区间（标签区域）。"""
+        cached = self._key_spans.get(i)
+        if cached is None:
+            text = self.blocks[i].text
+            cached = []
+            for name in [self.spec.key, *self.spec.aliases]:
+                if name:
+                    cached.extend((k, k + len(name)) for k in _all_occurrences(text, name))
+            self._key_spans[i] = cached
+        return cached
+
+    def paren_spans(self, i: int) -> list[tuple[int, int]]:
+        """括号内的选项列表（形如“（A/B）”）区间。"""
+        cached = self._paren_spans.get(i)
+        if cached is None:
+            cached = [(m.start(), m.end()) for m in _PAREN_LIST_RE.finditer(self.blocks[i].text)]
+            self._paren_spans[i] = cached
+        return cached
+
+    def is_long(self, i: int) -> bool:
+        return self._long[i]
+
+    def raw_index(self, block_id: str) -> int | None:
+        return self._index.get(block_id)
+
+    def prev_tail(self, i: int) -> str | None:
+        """块 i 之前一块的末尾有效字符，仅当两块可以相连（同页、或前一块带 CONTINUED 标记，或非 PDF）。"""
+        j = i - 1
+        if j < 0 or not self.available(j):
+            return None
+        bj, bi = self.blocks[j], self.blocks[i]
+        if bj.table is not None or bi.table is not None:
+            return None  # 表格单元格之间不构成文本相连
+        a, b = bj.locator, bi.locator
+        if not (isinstance(a, PdfLocator) and isinstance(b, PdfLocator)):
+            return None  # 只有 PDF 文本块才可能跨行/跨页相连
+        if a.page_number != b.page_number and BlockFlag.CONTINUED_ON_NEXT_PAGE not in bj.flags:
+            return None
+        text = self.blocks[j].text
+        return _char_before_skip(text, len(text))
 
     def available(self, i: int) -> bool:
-        return self._include_hidden or not self._hidden[i]
+        return (self._include_hidden or not self._hidden[i]) and not self._long[i]
+
 
     def index_of(self, block_id: str) -> int | None:
         i = self._index.get(block_id)
@@ -713,6 +1006,7 @@ class Verifier:
     def _verify(self, candidate: Candidate, doc: ParsedDocument, spec: KeySpec) -> ExtractionRecord:
         ctx = _Ctx(doc, spec, self._include_hidden, self._norm, self._values)
         value_text = _clean_value_text(candidate.value_text)
+        ctx.value_text = value_text
         claims = list(candidate.evidence)
 
         # 步骤 1：M1 不支持多值与派生
@@ -797,12 +1091,15 @@ class Verifier:
         value: NormalizedValue | None = None
         value_issues: list[Issue] = []
         numeric: tuple[str, str] | None = None
+        hdr_hidden = False
         try:
             value = self._values.parse_value(value_text, spec)
         except (ValueError, ArithmeticError):
             hv = _header_money(self._values, value_text, spec, drafts, ctx)
             if hv is not None:
-                value, numeric = hv
+                value, numeric, hdr_hidden = hv
+                if hdr_hidden:
+                    value_issues.append(_issue(IssueCode.HIDDEN_SOURCE, Severity.WARNING, "金额单位来自隐藏的表头"))
             elif spec.value_type == ValueType.ENUM:
                 value_issues.append(_issue(IssueCode.ENUM_OUT_OF_RANGE, Severity.ERROR, "值不在枚举选项中"))
             else:
@@ -817,16 +1114,28 @@ class Verifier:
             crossing_any = any(d.crossing for d in drafts)
             negated_any = any(d.negated for d in drafts)
             unit_conflict = spec.unit is not None and _unit_conflict(value, bearing, spec.unit)
-            if drafts and not bearing:
-                value_issues.append(
-                    _issue(IssueCode.VALUE_NOT_IN_QUOTE, Severity.ERROR, "引文中找不到与值等价且完整位于引文内的表述")
-                )
+            if drafts and not bearing and not any(d.too_many for d in drafts):
+                if any(d.label_only for d in drafts):
+                    msg = "值只出现在标签区（键名、别名、选项列表或未勾选项中）"
+                else:
+                    msg = "引文中找不到与值等价且完整位于引文内的表述"
+                value_issues.append(_issue(IssueCode.VALUE_NOT_IN_QUOTE, Severity.ERROR, msg))
             if unit_conflict:
                 value_issues.append(_issue(IssueCode.UNIT_MISMATCH, Severity.ERROR, "引文中的单位与键定义的单位不一致"))
 
+        too_many = any(d.too_many for d in drafts)
         # 步骤 6：判定
         good = [d for d in bearing if not d.negated]
-        grounded = value is not None and bool(good) and not crossing_any and not negated_any and not unit_conflict
+        if too_many:
+            value_issues.append(_issue(IssueCode.QUOTE_AMBIGUOUS, Severity.ERROR, "引文出现次数过多，无法逐处确认"))
+        grounded = (
+            value is not None
+            and bool(good)
+            and not crossing_any
+            and not negated_any
+            and not unit_conflict
+            and not too_many
+        )
         status = Status.GROUNDED if grounded else Status.NEEDS_REVIEW
         fail_sev = Severity.WARNING if grounded else Severity.ERROR
         fail_issues = [i.model_copy(update={"severity": fail_sev}) for i in fail_issues]
@@ -846,6 +1155,9 @@ class Verifier:
 
     # ------------------------------------------------------------ 步骤 4 定位
     def _locate_claim(self, claim: EvidenceClaim, ctx: _Ctx, allow_fuzzy: bool) -> _Outcome:
+        raw = ctx.raw_index(claim.block_id)
+        if raw is not None and ctx.is_long(raw):
+            return _Outcome(fail=(IssueCode.CONTEXT_TRUNCATED, "块过长（超过 20000 字符），未做校验"))
         variants = _variants(claim.quote)
         claimed = ctx.index_of(claim.block_id)
 
@@ -1003,20 +1315,40 @@ class Verifier:
         spec: KeySpec,
         numeric: tuple[str, str] | None = None,
     ) -> None:
-        """所有 grounded 路径共用的值检查。对引文在块内的**每一处出现**逐一检查（_check_at）：
+        """所有 grounded 路径共用的值检查。对引文在块内的每一处出现逐一检查（_check_at）。
 
-        * 值区间只取第一处出现（证据的引文区间即第一处），且只能来自第一处；
-        * 任一处出现触发截断、符号/序数、疑问标签或否定守卫，整条证据即带相应标记，判 needs_review。
+        * 出现次数超过 MAX_OCCURRENCES_CHECKED 时无法逐处确认 → too_many（needs_review）；
+        * 值区间只取第一处出现，且只能来自第一处（证据的引文区间即第一处）；
+        * 任一处出现触发截断、标签区、否定等守卫，整条证据即带相应标记。
         """
         text = ctx.text(d.span.index)
         first = (d.span.start, d.span.end)
         occs = d.span.occ_spans or (first,)
+        if len(occs) > MAX_OCCURRENCES_CHECKED:
+            d.too_many = True
+            return
+        # 出现处若严格位于另一个**不等价**的更长提及之内（如“含税”位于“不含税”之内），它是另一个值的表述的一部分，
+        # 不作为该值的独立出现处；只有当没有其他出现处时，才对它做守卫检查（以便给出否定/截断标记）。
+        other_values = [
+            (ma, mb)
+            for ma, mb, vm in ctx.mentions(d.span.index)
+            if not ctx.values.equivalent(vm.value, value, spec)
+        ]
+        excluded = tuple(
+            (a, b)
+            for a, b in occs
+            if any(ma <= a and b <= mb and (ma, mb) != (a, b) for ma, mb in other_values)
+        )
+        kept = tuple(o for o in occs if o not in excluded)
+        occs = kept if kept else excluded
         for a, b in occs:
             chk = _check_at(text, ctx, d.span.index, a, b, value, spec, numeric)
-            if chk.vstart is not None and (a, b) == first and d.vstart is None:
-                d.vstart, d.vend, d.mention_unit = chk.vstart, chk.vend, chk.mention_unit
-                if numeric is not None:
-                    d.unit_source = numeric[1]
+            if (a, b) == first:
+                d.label_only = chk.label_only
+                if chk.vstart is not None and d.vstart is None:
+                    d.vstart, d.vend, d.mention_unit = chk.vstart, chk.vend, chk.mention_unit
+                    if numeric is not None:
+                        d.unit_source = numeric[1]
             if chk.crossing:
                 d.crossing = True
                 d.crossing_note = d.crossing_note or chk.crossing_note

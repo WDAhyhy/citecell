@@ -117,9 +117,7 @@ def _span_text(rec, text: str) -> tuple[str, int]:
 # ---------------------------------------------------------------------------
 
 LABEL_THEN_ANSWER = [
-    ("leading_punct_space_join", "。是否含税 为含税", "。是否含税 为含税", "含税", "为含税"),
     ("colon", "是否含税：含税", "是否含税：含税", "含税", "：含税"),
-    ("space", "是否含税 含税", "是否含税 含税", "含税", " 含税"),
 ]
 
 
@@ -138,6 +136,21 @@ def test_value_span_goes_to_answer_not_question_label(name, text, quote, value, 
 # ---------------------------------------------------------------------------
 
 
+def test_answer_after_key_space_grounded():
+    """键名之后紧跟空白即进入答案区（第五轮规则）。"""
+    text = "是否含税 含税"
+    rec = _run(text, BOOL, text, "含税")
+    assert rec.status == Status.GROUNDED
+
+
+def test_answer_after_wei_separator_grounded():
+    """“为”是答案区分隔符（第四轮规则）：“。是否含税为含税”中的答案可 grounded。"""
+    text = "。是否含税为含税"
+    rec = _run(text, BOOL, "为含税", "含税")
+    assert rec.status == Status.GROUNDED
+    assert rec.value.value is True
+
+
 def test_answer_before_label_takes_first_passing_mention():
     text = "含税，是否含税"
     rec = _run(text, BOOL, text, "含税")
@@ -146,10 +159,10 @@ def test_answer_before_label_takes_first_passing_mention():
 
 
 def test_all_mentions_guarded_stays_needs_review():
+    """“含税”同时位于键名“是否含税”内部（标签区）与问句中，没有值候选，保持 needs_review。"""
     text = "是否含税，是否含税"
     rec = _run(text, BOOL, text, "含税")
     assert rec.status == Status.NEEDS_REVIEW
-    assert IssueCode.NEGATION_CONTEXT in {i.code for i in rec.issues}
 
 
 def test_only_label_stays_needs_review():
@@ -197,7 +210,7 @@ def test_text_value_label_occurrence_not_chosen():
 
 @pytest.mark.parametrize("fmt", [DocFormat.DOCX, DocFormat.XLSX, DocFormat.PDF])
 def test_label_then_answer_all_formats(fmt):
-    text = "。是否含税 为含税"
+    text = "。是否含税：含税"
     rec = _run(text, BOOL, text, "含税", fmt)
     assert rec.status == Status.GROUNDED
     assert _span_text(rec, text)[1] == text.rindex("含税")

@@ -149,6 +149,19 @@ class SimpleMerger:
         alternatives = review_alts
         info = _copy_issues([i for r in group for i in r.issues if i.severity == Severity.INFO])
         issues = info + review_issues + warn_failed
+        # 采纳值与待复核候选不等价或存在单位冲突：仍保持 grounded，但附 warning 级 CONFLICTING_CANDIDATES。
+        conflict = any(
+            r.value is not None
+            and (
+                not self._values.equivalent(r.value, chosen_value, spec)
+                or any(i.code == IssueCode.UNIT_MISMATCH for i in r.issues)
+            )
+            for r in review
+        )
+        if conflict:
+            issues.append(
+                Issue(code=IssueCode.CONFLICTING_CANDIDATES, severity=Severity.WARNING, message="采纳值与待复核候选不一致（值或单位冲突）")
+            )
         first = group[0]
         return self._make(
             doc_id, spec, Status.GROUNDED, chosen_value, first.value_text, evidence, first.method,
