@@ -79,3 +79,23 @@ def match_unit(folded: str, pos: int) -> tuple[int, str] | None:
     if m and not any(ch in CN_NUMERAL_CHARS for ch in m.group("raw")):
         return pos + m.end(), canon_unit(m.group("raw"))
     return None
+
+
+# 中文数字后的「已知单位」（用于单字数字与中文数字串的提及识别）。
+# 比 UNIT_CANON 更严：裸「月」「日」「时」不列入（「三月」「一日三餐」「一时」有其他意义）；
+# 「年」后接「级」视为非单位。
+_CN_KNOWN_RE = re.compile(
+    r"\s*\(?\s*(?:"
+    r"(?P<pre>个)\s*(?P<w1>月份|月|天|工作日|年|周|星期|小时)"
+    r"|(?P<w2>天|工作日|年|周|星期|小时)(?!级)"
+    r")\s*\)?"
+)
+
+
+def match_cn_known_unit(folded: str, pos: int) -> tuple[int, str] | None:
+    """中文数字之后的已知单位（窗口内）。返回 (结束位置, 规范单位)，否则 None。"""
+    m = _CN_KNOWN_RE.match(folded[pos : pos + UNIT_WINDOW])
+    if not m:
+        return None
+    word = m.group("w1") or m.group("w2")
+    return pos + m.end(), canon_unit(word)

@@ -49,14 +49,14 @@ from citecell.values.dates import find_date_spans, parse_date_text
 from citecell.values.money import find_money_spans, money_value
 from citecell.values.numerals import parse_cn_integer
 from citecell.values.percent import find_percent_spans, parse_percent_text
-from citecell.values.units import canon_unit, match_unit
+from citecell.values.units import canon_unit, match_cn_known_unit, match_unit
 
 _NUMBER_FULL = re.compile(
     rf"^(?P<sign>[-负－])?(?P<body>{NUMERIC}|[{CN_NUMERAL_CHARS}]+)(?P<scale>[千万亿])?(?P<rest>.*)$",
     re.DOTALL,
 )
 _NUMBER_ARABIC_FIND = re.compile(rf"(?<![0-9A-Za-z.,\-/])(?:-)?{NUMERIC}[千万亿]?")
-_NUMBER_CN_FIND = re.compile(rf"(?:-|负)?[{CN_NUMERAL_CHARS}]+")
+_NUMBER_CN_RUN_FIND = re.compile(rf"(?<![0-9A-Za-z.,\-/])(?:-|负)?[{CN_NUMERAL_CHARS}]+")
 _UNIT_GENERIC_AFTER = re.compile(r"\s?个?([一-鿿]{1,2})(?![一-鿿])")
 
 
@@ -169,25 +169,32 @@ class ValueNormalizerV1:
 
     def _find_numbers(self, text: str, spec: KeySpec) -> list[ValueMention]:
         folded = width_fold(text)
-        spans: list[tuple[int, int, object]] = []
+        # 候选：(起点, 数值部分终点, 提及终点, 单位)
+        cands: list[tuple[int, int, int, str | None]] = []
         for m in _NUMBER_ARABIC_FIND.finditer(folded):
-            spans.append((m.start(), m.end(), None))
-        for m in _NUMBER_CN_FIND.finditer(folded):
-            if any(ch in CN_UNIT_CHARS for ch in m.group(0)):
-                spans.append((m.start(), m.end(), None))
+            end, unit = self._extend_unit(folded, m.end(), spec.unit)
+            cands.append((m.start(), m.end(), end, unit))
+        for m in _NUMBER_CN_RUN_FIND.finditer(folded):
+            run = m.group(0)
+            has_unit_char = any(ch in CN_UNIT_CHARS for ch in run)
+            known = match_cn_known_unit(folded, m.end())
+            if not has_unit_char and not (known and len(run.lstrip("负-")) == 1):
+                continue  # 普通词中的"一"、"二"等不是数字提及
+            if known:
+                cands.append((m.start(), m.end(), known[0], known[1]))
+            else:
+                end, unit = self._extend_unit(folded, m.end(), spec.unit)
+                cands.append((m.start(), m.end(), end, unit))
 
         mentions: list[ValueMention] = []
-        for start, end, _ in _resolve_longest(spans):
+        for start, num_end, end, unit in sorted(cands, key=lambda c: (c[0], -(c[2] - c[0]))):
+            if mentions and start < mentions[-1].end:
+                continue  # 区间重叠：保留先出现且较长者
             try:
-                number = _parse_number(text[start:end], allow_unit=True)
+                number = _parse_number(text[start:num_end], allow_unit=False)
             except ValueParseError:
                 continue
-            if mentions and start < mentions[-1].end:
-                continue  # 防御：理论上不会发生，保证区间互不重叠
-            end, unit = self._extend_unit(folded, end, spec.unit)
-            mentions.append(
-                self._mention(text, start, end, NumberValue(value=number.value, unit=unit))
-            )
+            mentions.append(self._mention(text, start, end, NumberValue(value=number.value, unit=unit)))
         return mentions
 
     @staticmethod
