@@ -49,10 +49,11 @@ from citecell.values.dates import find_date_spans, parse_date_text
 from citecell.values.money import find_money_spans, money_value
 from citecell.values.numerals import parse_cn_integer
 from citecell.values.percent import find_percent_spans, parse_percent_text
+from citecell.values.units import canon_unit, match_unit
 
 _NUMBER_FULL = re.compile(
-    rf"^(?P<sign>[-负－])?(?P<body>{NUMERIC}|[{CN_NUMERAL_CHARS}]+)(?P<scale>[千万亿])?"
-    rf"(?P<unit>\s?(?:个)?[一-鿿]{{1,2}})?$"
+    rf"^(?P<sign>[-负－])?(?P<body>{NUMERIC}|[{CN_NUMERAL_CHARS}]+)(?P<scale>[千万亿])?(?P<rest>.*)$",
+    re.DOTALL,
 )
 _NUMBER_ARABIC_FIND = re.compile(rf"(?<![0-9A-Za-z.,\-/])(?:-)?{NUMERIC}[千万亿]?")
 _NUMBER_CN_FIND = re.compile(rf"(?:-|负)?[{CN_NUMERAL_CHARS}]+")
@@ -144,7 +145,9 @@ class ValueNormalizerV1:
         if a.type != b.type:
             return False
         if isinstance(a, NumberValue) and isinstance(b, NumberValue):
-            return a.value == b.value  # 单位不参与，见模块 docstring
+            if a.unit and b.unit and canon_unit(a.unit) != canon_unit(b.unit):
+                return False  # 两边都写明单位且规范化后不同 → 冲突
+            return a.value == b.value
         if isinstance(a, MoneyValue) and isinstance(b, MoneyValue):
             return a.amount == b.amount and a.currency == b.currency
         if isinstance(a, PercentValue) and isinstance(b, PercentValue):
@@ -189,18 +192,13 @@ class ValueNormalizerV1:
 
     @staticmethod
     def _extend_unit(folded: str, end: int, spec_unit: str | None) -> tuple[int, str | None]:
-        """spec.unit 存在时，把紧随数字的单位并入提及区间（见模块 docstring）。返回 (新 end, 单位)。"""
+        """spec.unit 存在时，在窗口内识别紧随数字的单位并并入提及区间。返回 (新 end, 规范单位)。"""
         if not spec_unit:
             return end, None
-        rest = folded[end:]
-        exact = re.match(rf"\s?个?{re.escape(spec_unit)}", rest)
-        if exact:
-            return end + exact.end(), spec_unit
-        generic = _UNIT_GENERIC_AFTER.match(rest)
-        # 通用单位不得吞掉中文数字字符（如 "3天柒十" 中的 "柒十" 是另一个数字）
-        if generic and not any(ch in CN_NUMERAL_CHARS for ch in generic.group(1)):
-            return end + generic.end(), generic.group(1)
-        return end, None
+        found = match_unit(folded, end)
+        if found is None:
+            return end, None
+        return found
 
     def _find_options(self, text: str, spec: KeySpec, *, boolean: bool) -> list[ValueMention]:
         if not spec.enum_options:
@@ -244,11 +242,15 @@ def _parse_number(s: str, allow_unit: bool = False) -> NumberValue:
         value = Decimal(parse_cn_integer(body))
     if m.group("sign"):
         value = -value
-    unit = m.group("unit")
-    if unit is not None:
+    unit: str | None = None
+    rest = m.group("rest")
+    if rest.strip():
         if not allow_unit:
             raise _fail("number")
-        unit = unit.strip().removeprefix("个") or None
+        found = match_unit(t, m.start("rest"))
+        if found is None or found[0] != len(t):
+            raise _fail("number")  # 单位必须占满剩余文本
+        unit = found[1]
     return NumberValue(value=value, unit=unit)
 
 
