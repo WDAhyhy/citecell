@@ -8,7 +8,8 @@
   （例如用 ``"2"`` 命中 ``㎡`` 展开出的 ``m2`` 中的 ``2``），该命中被丢弃，
   否则映射回的原文区间会比命中串更宽，且再归一化后不等于命中串。
 - FUZZY 使用 Sellers 算法（子串编辑距离，起点自由），在归一化文本上进行；
-  超过长度上限（原文 5000、引文 500 码点，可配置）直接返回空；
+  归一化后超过长度上限（文本 5000、引文 500 码点）或 m×n 超过单元格上限（5000×500）时直接返回空，
+  不做 DP；上限均可配置；
   编辑距离上限为 ``floor(len(引文归一化) * fuzzy_max_ratio)``，上限为 0 时不返回 FUZZY。
   FUZZY 命中互不重叠，按（距离、起点、终点）贪心选取。score = 1 - 距离 / 引文归一化长度。
 """
@@ -20,9 +21,16 @@ from citecell.textnorm.normalize import Normalizer
 
 VERSION = "matcher-v1"
 
-DEFAULT_FUZZY_MAX_TEXT = 5000
-DEFAULT_FUZZY_MAX_QUOTE = 500
+# FUZZY 上限一律按**归一化后**的码点数计算（NFKC 展开会大幅放大长度，例如 U+FDFA → 15 码点，
+# 若按原文计算，2000 原文码点可能膨胀到 3 万码点）。
+DEFAULT_FUZZY_MAX_TEXT = 5000  # 归一化文本码点上限
+DEFAULT_FUZZY_MAX_QUOTE = 500  # 归一化引文码点上限
 DEFAULT_FUZZY_MAX_RATIO = 0.2
+# m×n（归一化文本 × 归一化引文）单元格上限。取值 = 5000×500：归一化上限已隐含该值，
+# 此处显式声明，使"5000×500 规模仍可运行、更病态的组合被拒绝"成为可测的契约。
+# 实测（本机 Python 3.13，纯随机汉字串，文本 5000、引文 500 码点）单次 FUZZY 约 0.76–0.84 s，
+# 即约 0.3 µs/单元格；2.5M 单元格对应 <1 s 的耗时预算。
+DEFAULT_FUZZY_MAX_CELLS = 5000 * 500
 
 
 def _all_occurrences(hay: str, needle: str) -> list[int]:
@@ -85,11 +93,13 @@ class Matcher:
         fuzzy_max_text: int = DEFAULT_FUZZY_MAX_TEXT,
         fuzzy_max_quote: int = DEFAULT_FUZZY_MAX_QUOTE,
         fuzzy_max_ratio: float = DEFAULT_FUZZY_MAX_RATIO,
+        fuzzy_max_cells: int = DEFAULT_FUZZY_MAX_CELLS,
     ) -> None:
         self._norm = Normalizer()
         self._fuzzy_max_text = fuzzy_max_text
         self._fuzzy_max_quote = fuzzy_max_quote
         self._fuzzy_max_ratio = fuzzy_max_ratio
+        self._fuzzy_max_cells = fuzzy_max_cells
 
     def find(self, quote: str, text: str, *, allow_fuzzy: bool = False) -> list[QuoteMatch]:
         q = quote.strip()
@@ -121,9 +131,11 @@ class Matcher:
         return []
 
     def _fuzzy(self, q: str, text: str, nt: NormalizedText, nq: str) -> list[QuoteMatch]:
-        if len(text) > self._fuzzy_max_text or len(q) > self._fuzzy_max_quote:
-            return []
         m = len(nq)
+        n = len(nt.text)
+        # 全部上限按归一化长度计算，超限直接返回空（不做任何 DP）
+        if n > self._fuzzy_max_text or m > self._fuzzy_max_quote or n * m > self._fuzzy_max_cells:
+            return []
         max_dist = int(m * self._fuzzy_max_ratio)
         if max_dist <= 0:
             return []
