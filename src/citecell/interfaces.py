@@ -259,11 +259,21 @@ class ContextPlanner(Protocol):
 
     文档渲染后不超过预算 ⇒ 单窗口问全部键；否则按键检索相关块（字符二元组 BM25 + 别名 +
     邻块 + 表头），把共享块的键分组成多个窗口。窗口内块保持文档顺序。
+
+    ``config`` 为可选：提供时规划器读取 ``prefilter``、``max_keys_per_window``（ARCH §6.5、§7.1）
+    和 ``table_style``；为 None 时等价于默认的 ``RunConfig``（保持原有行为）。
     """
 
     version: str
 
-    def plan(self, doc: ParsedDocument, keys: Sequence[KeySpec], *, budget_tokens: int) -> list[ContextWindow]:
+    def plan(
+        self,
+        doc: ParsedDocument,
+        keys: Sequence[KeySpec],
+        *,
+        budget_tokens: int,
+        config: RunConfig | None = None,
+    ) -> list[ContextWindow]:
         ...
 
 

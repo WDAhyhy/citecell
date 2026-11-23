@@ -33,6 +33,10 @@ pymupdf-agpl = ["PyMuPDF>=1.24"]  # AGPL-3.0 / Artifex 商业双授权
 [tool.setuptools.packages.find]
 where = ["src"]
 
+# 提示词模板是包内数据文件，普通安装（非可编辑）时也必须带上
+[tool.setuptools.package-data]
+citecell = ["prompting/templates/*.txt"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
