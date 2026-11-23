@@ -298,6 +298,38 @@ _QUESTION_WORD = "是否"
 _QUESTION_WINDOW = 3
 
 
+def _before(text: str, p: int, n: int) -> str:
+    """位置 p 之前的最后 n 个字符，忽略其间的空白（PDF 行连接、版式空格不影响上下文判断）。"""
+    return text[:p].rstrip()[-n:] if n > 0 else ""
+
+
+def _guards(
+    text: str, p: int, spec: KeySpec, overlaps: bool, value_bearing: bool
+) -> tuple[str | None, str | None]:
+    """位置 p（提及或引文的起点）上的守卫，返回 (截断说明或 None, 否定说明或 None)。
+
+    * 符号 / 序数（value_bearing 且 NUMBER/MONEY/PERCENT）：紧邻前一个字符是符号 → 截断；是“第” → 序数截断。
+    * 疑问标签 / 否定（overlaps 且 BOOLEAN/ENUM/TEXT）：前 3 字符含“是否” → 疑问标签上下文；
+      前 2 字符含否定字 → 否定上下文。
+    """
+    crossing_note: str | None = None
+    negated_note: str | None = None
+    if p <= 0:
+        return None, None
+    if value_bearing and spec.value_type in _SIGN_TYPES:
+        prev = _before(text, p, 1)
+        if prev in _SIGN_CHARS:
+            crossing_note = "数值符号被引文边界截断"
+        elif prev == _ORDINAL_CHAR:
+            crossing_note = "序数上下文（第…），不是数量或时长"
+    if overlaps and spec.value_type in _NEGATION_TYPES:
+        if _QUESTION_WORD in _before(text, p, _QUESTION_WINDOW):
+            negated_note = "疑问标签上下文（引文位于“是否”之后），不能据此判定"
+        elif any(ch in NEGATION_CHARS for ch in _before(text, p, NEGATION_WINDOW)):
+            negated_note = "值前紧邻否定字，不能据此判定"
+    return crossing_note, negated_note
+
+
 def _check_at(
     text: str,
     ctx: _Ctx,
@@ -310,13 +342,11 @@ def _check_at(
 ) -> _Check:
     """在块文本的 [qs, qe) 这一处出现上检查值（整块上的提及，不随引文截断）。
 
-    * 与引文相交但不完全位于其内、且引文边界拆开了记号 → 截断（crossing）；
-      边界不拆记号时（如“人民币120万元”引为“120万元”）视为外延，若交集本身即等价完整表述则可用。
-    * 完全位于引文内且与值等价的第一个提及 → 值区间与单位。
-    * 值区间存在时的守卫（都判 needs_review）：
-      - 符号或序数（NUMBER/MONEY/PERCENT）：引文起点紧邻符号或“第” → crossing；
-      - 疑问标签（BOOLEAN/ENUM/TEXT）：引文起点前 3 个字符内含“是否” → negated（疑问标签上下文）；
-      - 否定（BOOLEAN/ENUM/TEXT）：引文与提及相交，且起点前紧邻 2 个字符内含否定字 → negated。
+    * 与引文相交但不完全位于其内、且引文边界拆开了记号 → 截断（crossing）；边界不拆记号时，
+      若交集本身即等价完整表述（如“人民币120万元”引为“120万元”）则可作为值区间。
+    * 完全位于引文内且与值等价的提及：**逐个**检查守卫（守卫看每个提及自身的起点），
+      取第一个通过全部守卫的提及作为值区间；全部未通过则取第一个并标记守卫说明（needs_review）。
+    * 其他情形（外延交集、表格整格、截断兜底）的值区间起点为 vstart，守卫在 vstart 上检查。
     """
     chk = _Check()
     if isinstance(value, TextValue):
@@ -381,36 +411,47 @@ def _check_at(
                 chk.mention_unit = parsed.unit
 
     if inside:
-        a, b, vm = inside[0]
+        # 逐个提及检查守卫：取第一个通过全部守卫的提及。
+        chosen: tuple[int, int, ValueMention | None] | None = None
+        first_bad: tuple[int, int, ValueMention | None, str | None, str | None] | None = None
+        for a, b, vm in inside:
+            cn, ng = _guards(text, a, spec, overlaps, True)
+            if cn is None and ng is None:
+                chosen = (a, b, vm)
+                break
+            if first_bad is None:
+                first_bad = (a, b, vm, cn, ng)
+        if chosen is not None:
+            a, b, vm = chosen
+        else:
+            assert first_bad is not None
+            a, b, vm, cn, ng = first_bad
+            if cn is not None:
+                chk.crossing = True
+                chk.crossing_note = chk.crossing_note or cn
+            if ng is not None:
+                chk.negated = True
+                chk.negated_note = ng
         chk.vstart, chk.vend = a, b
         if vm is not None and isinstance(vm.value, NumberValue):
             chk.mention_unit = vm.value.unit
-    elif clean_outside and not chk.crossing:
+        return chk
+
+    if clean_outside and not chk.crossing:
         a, b, vm = clean_outside[0]
         chk.vstart, chk.vend = a, b
         if vm is not None and isinstance(vm.value, NumberValue):
             chk.mention_unit = vm.value.unit
 
-    # 守卫（值区间存在时）：符号 / 序数
-    if chk.vstart is not None and spec.value_type in _SIGN_TYPES and qs > 0:
-        prev = text[qs - 1]
-        if prev in _SIGN_CHARS:
-            chk.crossing = True
-            chk.crossing_note = chk.crossing_note or "数值符号被引文边界截断"
-        elif prev == _ORDINAL_CHAR:
-            chk.crossing = True
-            chk.crossing_note = chk.crossing_note or "序数上下文（第…），不是数量或时长"
-
-    # 守卫：疑问标签 / 否定
-    if overlaps and spec.value_type in _NEGATION_TYPES and qs > 0:
-        if _QUESTION_WORD in text[max(0, qs - _QUESTION_WINDOW) : qs]:
-            chk.negated = True
-            chk.negated_note = "疑问标签上下文（引文位于“是否”之后），不能据此判定"
-        else:
-            window = text[max(0, qs - NEGATION_WINDOW) : qs]
-            if any(ch in NEGATION_CHARS for ch in window):
-                chk.negated = True
-                chk.negated_note = "值前紧邻否定字，不能据此判定"
+    # 无内部值区间时：守卫在 vstart（或引文起点）上检查。
+    pos = chk.vstart if chk.vstart is not None else qs
+    cn, ng = _guards(text, pos, spec, overlaps, chk.vstart is not None)
+    if cn is not None:
+        chk.crossing = True
+        chk.crossing_note = chk.crossing_note or cn
+    if ng is not None:
+        chk.negated = True
+        chk.negated_note = ng
     return chk
 
 
