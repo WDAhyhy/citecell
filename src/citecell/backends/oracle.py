@@ -3,7 +3,10 @@
 用途：无需 GPU 即可给出流水线上限，并度量校验器对每类错误的拦截率（ARCH §7，ADR-013）。
 * 由 GoldDocument 列表与 ParsedDocument 列表构造；文档按 ``doc_sha256`` ↔ ``info.sha256`` 关联。
 * 根据 ``request.context`` 定位文档、窗口（``block_ids``）与键；缺 context 或未知文档/键 → BackendError。
-* 引文取金标准 surface 在所在块中的原文（逐字子串）。金标准中的值不在窗口块内 → 输出 ``value=null``。
+* 证据按金标准提及的**原生位置**选块（DOCX 段落/表格行列、XLSX sheet+cell、PDF 页码+字符几何），
+  永不按文本搜索，也永不取干扰项的位置。
+* 引文是块内的逐字子串：从提及的真实字符区间向左扩展上下文，直到在块内恰好出现一次，且包含完整提及；
+  超过 ``QUOTE_MAX_CHARS`` 则取以提及为中心的窗口。金标准中的值不在窗口块内 → 输出 ``value=null``。
 * NoisyOracle 的随机性只来自带 seed 的 ``random.Random``；每次调用的 RNG 由
   ``(seed, doc_id, window_id, attempt_index)`` 派生，因此结果与调用顺序（并发）无关。
 
@@ -18,7 +21,9 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 
 from citecell.interfaces import BackendError
+from citecell.textnorm import Normalizer
 from citecell.models import (
+    BBox,
     Block,
     BackendInfo,
     ChatRequest,
@@ -43,30 +48,150 @@ log = logging.getLogger("citecell.backends")
 _HALLUCINATION_RANGE = (100_000, 999_999)
 
 
+QUOTE_MAX_CHARS = 80  # 引文长度上限（字符）
+
+
 @dataclass(frozen=True, slots=True)
 class _KeyTruth:
     key: str
     record: GoldRecord
-    block: Block | None  # 窗口内含该值的块（无则 None）
+    block: Block | None  # 窗口内承载该值的块（无则 None）
     mention: GoldMention | None
+    quote: str | None = None  # 块内的唯一引文（包含完整提及）
 
 
-def _same_place(a: object, b: object) -> bool:
+def _docx_position(loc: DocxLocator) -> tuple:
+    return (loc.body_index, loc.paragraph_number, loc.table_number, loc.row_index, loc.col_index)
+
+
+def _regions_overlap(a: list[BBox], b: list[BBox]) -> bool:
+    return any(
+        min(p.x1, q.x1) > max(p.x0, q.x0) and min(p.y1, q.y1) > max(p.y0, q.y0)
+        for p in a
+        for q in b
+    )
+
+
+def _center_in_regions(bbox: BBox, regions: list[BBox]) -> bool:
+    cx = (bbox.x0 + bbox.x1) / 2
+    cy = (bbox.y0 + bbox.y1) / 2
+    return any(r.x0 <= cx <= r.x1 and r.y0 <= cy <= r.y1 for r in regions)
+
+
+def same_native_place(a: object, b: object) -> bool:
+    """两个原生定位是否指向同一位置。
+
+    只比较位置字段：DOCX 为 body_index / 段落号 / 表格号 / 行 / 列；XLSX 为 sheet_name + cell；
+    PDF 为页码且区域有正面积重叠。不比较 number_format、style、formula 等属性。
+    格式不同一律为 False。
+    """
     if type(a) is not type(b):
         return False
-    if isinstance(a, PdfLocator) and isinstance(b, PdfLocator):
-        return a.page_number == b.page_number
     if isinstance(a, DocxLocator) and isinstance(b, DocxLocator):
-        return (a.body_index, a.paragraph_number, a.table_number, a.row_index, a.col_index) == (
-            b.body_index,
-            b.paragraph_number,
-            b.table_number,
-            b.row_index,
-            b.col_index,
-        )
+        return _docx_position(a) == _docx_position(b)
     if isinstance(a, XlsxLocator) and isinstance(b, XlsxLocator):
-        return a.model_dump() == b.model_dump()
+        return a.sheet_name == b.sheet_name and a.cell == b.cell
+    if isinstance(a, PdfLocator) and isinstance(b, PdfLocator):
+        return a.page_number == b.page_number and _regions_overlap(a.regions, b.regions)
     return False
+
+
+def _mention_span(block: Block, mention: GoldMention) -> tuple[int, int] | None:
+    """提及在块文本中的字符区间；该块不承载此提及时返回 None。
+
+    * DOCX：先用金标准的 char_start/char_end（相对段落/单元格文本），不一致则取 surface 的首次出现。
+    * XLSX：整格（块文本即单元格文本）。
+    * PDF：块内字符的几何片段（TextFragment）中，中心落在提及区域内的那些字符的范围。
+    """
+    ml = mention.locator
+    text = block.text
+    surface = mention.surface_text
+    if isinstance(ml, PdfLocator):
+        hits = [
+            f
+            for f in block.fragments
+            if f.page_number == ml.page_number and _center_in_regions(f.bbox, ml.regions)
+        ]
+        if not hits:
+            return None
+        s = min(f.start for f in hits)
+        e = max(f.end for f in hits)
+        if text[s:e] == surface:
+            return s, e
+        occ = _occurrences(text, surface)
+        if occ:
+            o = min(occ, key=lambda x: abs(x - s))
+            return o, o + len(surface)
+        return (s, e) if e > s else None
+    if not same_native_place(block.locator, ml):
+        return None
+    if isinstance(ml, XlsxLocator):
+        return (0, len(text)) if text else None
+    cs, ce = mention.char_start, mention.char_end
+    if cs is not None and ce is not None and text[cs:ce] == surface:
+        return cs, ce
+    idx = text.find(surface)
+    return (idx, idx + len(surface)) if idx >= 0 else None
+
+
+def _occurrences(hay: str, needle: str) -> list[int]:
+    out: list[int] = []
+    if not needle:
+        return out
+    i = hay.find(needle)
+    while i >= 0:
+        out.append(i)
+        i = hay.find(needle, i + 1)
+    return out
+
+
+_NORMALIZER = Normalizer()
+
+
+def _is_unique_quote(text: str, norm_text: str, quote: str) -> bool:
+    """引文在块内是否唯一：原文中恰好一次，且归一化后（校验器的匹配方式）也恰好一次。
+
+    引文首尾不得是空白（校验器会忽略空白，首尾空白会让唯一性失效）。
+    """
+    if not quote or quote[0].isspace() or quote[-1].isspace():
+        return False
+    if text.count(quote) != 1:
+        return False
+    nq = _NORMALIZER.normalize(quote).text
+    return bool(nq) and norm_text.count(nq) == 1
+
+
+def expand_quote(text: str, start: int, end: int, cap: int = QUOTE_MAX_CHARS) -> tuple[str, int, int]:
+    """从提及区间 [start, end) 出发，向左（不足则向右）扩展上下文，直到引文在块内恰好出现一次。
+
+    * 引文始终包含完整提及。
+    * 超过 ``cap`` 仍不唯一：取以提及为中心、长度为 ``cap`` 的窗口（可能仍不唯一，由校验器裁决）。
+    * 提及本身不短于 ``cap``：原样返回提及。
+    返回 (引文, 引文在块内的起点, 引文在块内的终点)。
+    """
+    if not 0 <= start < end <= len(text):
+        raise ValueError("提及区间越界")
+    if end - start >= cap:
+        return text[start:end], start, end
+    norm_text = _NORMALIZER.normalize(text).text
+    left, right = start, end
+    while True:
+        quote = text[left:right]
+        if _is_unique_quote(text, norm_text, quote):
+            return quote, left, right
+        if right - left >= cap:
+            break
+        if left > 0:
+            left -= 1
+        elif right < len(text):
+            right += 1
+        else:
+            break
+    width = min(cap, len(text))
+    ws = max(0, min(start - (width - (end - start)) // 2, len(text) - width))
+    if not (ws <= start and ws + width >= end):  # pragma: no cover - 数学上不会发生
+        raise RuntimeError("中心窗口未包含提及")
+    return text[ws : ws + width], ws, ws + width
 
 
 class OracleBackend:
@@ -118,40 +243,39 @@ class OracleBackend:
                 raise BackendError(f"金标准中没有键 {key!r}")
             if rec.expected == "derived":
                 raise BackendError("M1 Oracle 不支持 derived 金标准（M3 再实现）")
-            block, mention = self._locate(parsed, rec, allowed)
-            truths.append(_KeyTruth(key=key, record=rec, block=block, mention=mention))
+            block, mention, quote = self._locate(parsed, rec, allowed)
+            truths.append(_KeyTruth(key=key, record=rec, block=block, mention=mention, quote=quote))
         return gold, parsed, truths
 
     @staticmethod
     def _locate(
         parsed: ParsedDocument, rec: GoldRecord, allowed: set[str]
-    ) -> tuple[Block | None, GoldMention | None]:
+    ) -> tuple[Block | None, GoldMention | None, str | None]:
+        """按金标准提及的**原生位置**选块（不做文本搜索，干扰项永不作为证据）。"""
         if rec.expected != "present":
-            return None, None
+            return None, None, None
         for mention in rec.mentions:
-            cands = [
-                b
-                for b in parsed.blocks
-                if (not allowed or b.block_id in allowed) and mention.surface_text in b.text
-            ]
-            if not cands:
-                continue
-            exact = [b for b in cands if _same_place(b.locator, mention.locator)]
-            return (exact or cands)[0], mention
-        return None, None
+            for block in parsed.blocks:
+                if allowed and block.block_id not in allowed:
+                    continue
+                span = _mention_span(block, mention)
+                if span is None:
+                    continue
+                quote, _, _ = expand_quote(block.text, span[0], span[1])
+                return block, mention, quote
+        return None, None, None
 
     def _output_for(self, truths: list[_KeyTruth]) -> LLMExtractionOutput:
         fields: list[LLMFieldOutput] = []
         for t in truths:
-            if t.block is None or t.mention is None:
+            if t.block is None or t.mention is None or t.quote is None:
                 fields.append(LLMFieldOutput(key=t.key, evidence=[], value=None))
             else:
-                surface = t.mention.surface_text
                 fields.append(
                     LLMFieldOutput(
                         key=t.key,
-                        evidence=[EvidenceClaim(block_id=t.block.block_id, quote=surface)],
-                        value=surface,
+                        evidence=[EvidenceClaim(block_id=t.block.block_id, quote=t.quote)],
+                        value=t.mention.surface_text,
                     )
                 )
         return LLMExtractionOutput(fields=fields)
