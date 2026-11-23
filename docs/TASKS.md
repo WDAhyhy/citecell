@@ -213,7 +213,7 @@ test -s docs/VERIFICATION_T0.md && test -s docs/THIRD_PARTY_LICENSES.md
 **追加（档位，ARCH §7.1）**：
 - 独占文件新增 `src/citecell/backends/profiles.py` 与 `tests/backends/test_profiles.py`。
 - `profiles.py` 提供函数 `get_profile(name, backend) -> RunConfig`，内置 `cpu-lite`、`cpu-std`、`gpu-std`、`gpu-ref` 四个预设，取值按 ARCH §7.1 表中的**初始假设**写成常量并加注释"待实测校准"；未知档位名 → 报错并列出可用档位。预设不得包含任何模型下载地址或真实模型仓库名（这些未核实），模型名由调用方传入。
-- 验收：四个预设都能通过 `RunConfig.model_validate`；`cpu-*` 档的 `prefilter == "always"` 且 `max_keys_per_window` 非空；`gpu-*` 档的 `prefilter == "auto"`；`gpu-ref` 的文档字符串中必须出现"仅作评测参考"字样；`RunConfig.profile` 等于所选档位名；同一档位两次调用得到的规范 JSON 哈希相同。
+- 验收：四个预设都能通过 `RunConfig.model_validate`；`cpu-*` 与 `gpu-*` 档的 `prefilter == "auto"`，且 `max_keys_per_window` 为 None（CPU 档的 always/键数限制被数据证明在短文档上反效果，见 ARCH §7.1，两个旋钮保留但不作默认）；`gpu-ref` 的文档字符串中必须出现"仅作评测参考"字样；`RunConfig.profile` 等于所选档位名；同一档位两次调用得到的规范 JSON 哈希相同。
 
 ---
 
