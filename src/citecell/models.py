@@ -266,6 +266,8 @@ class IssueCode(StrEnum):
     """引文紧邻的上文含否定词（不/未/非/无/没/否），布尔、枚举或文本值的语义可能相反。"""
     LOCATOR_ERROR = "locator_error"
     """定位失败（例如片段几何互相矛盾）。校验器不得因此抛异常，而是降为 needs_review。"""
+    UNIT_FROM_HEADER = "unit_from_header"
+    """金额的单位（元/万元等）取自列表头或单元格数字格式，而不是值所在单元格的文本。info 级，供复核界面显示。"""
 
 
 class EvidenceFlag(StrEnum):
