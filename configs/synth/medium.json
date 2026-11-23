@@ -1,0 +1,14 @@
+{
+  "layout": "perturbed",
+  "surface_variety": 0.4,
+  "distractors_per_key": 1,
+  "missing_rate": 0.1,
+  "duplicate_rate": 0.2,
+  "conflict_rate": 0.0,
+  "filler_blocks": 4,
+  "cross_block_rate": 0.1,
+  "table_style": "merged_header",
+  "hidden_row_rate": 0.1,
+  "derived_rate": 0.0,
+  "noise_rate": 0.1
+}

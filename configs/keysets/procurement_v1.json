@@ -1,0 +1,73 @@
+{
+  "name": "procurement_v1",
+  "version": "1",
+  "keys": [
+    {
+      "key": "合同编号",
+      "description": "采购合同的编号",
+      "value_type": "text",
+      "aliases": ["合同号", "编号"]
+    },
+    {
+      "key": "甲方",
+      "description": "采购方（虚构名称）",
+      "value_type": "text",
+      "aliases": ["采购方", "买方"]
+    },
+    {
+      "key": "乙方",
+      "description": "供应方（虚构名称）",
+      "value_type": "text",
+      "aliases": ["供应方", "卖方"]
+    },
+    {
+      "key": "合同金额",
+      "description": "合同总价，统一换算为元",
+      "value_type": "money",
+      "aliases": ["合同总价", "采购金额", "总金额"],
+      "currency": "CNY"
+    },
+    {
+      "key": "签订日期",
+      "description": "合同签订日期",
+      "value_type": "date",
+      "aliases": ["签约日期", "签署日期"]
+    },
+    {
+      "key": "付款比例",
+      "description": "首付款占合同金额的百分比",
+      "value_type": "percent",
+      "aliases": ["首付比例", "预付比例"]
+    },
+    {
+      "key": "质保期",
+      "description": "质量保证期",
+      "value_type": "number",
+      "unit": "月",
+      "aliases": ["质保时长", "保修期"]
+    },
+    {
+      "key": "采购方式",
+      "description": "采购组织形式",
+      "value_type": "enum",
+      "aliases": ["采购形式", "组织方式"],
+      "enum_options": [
+        {"value": "公开招标", "aliases": ["公开招标方式", "公开招标采购"]},
+        {"value": "邀请招标", "aliases": ["邀请招标方式"]},
+        {"value": "竞争性谈判", "aliases": ["谈判采购"]},
+        {"value": "单一来源", "aliases": ["单一来源采购"]},
+        {"value": "询价", "aliases": ["询价采购"]}
+      ]
+    },
+    {
+      "key": "是否含税",
+      "description": "合同金额是否含税",
+      "value_type": "boolean",
+      "aliases": ["含税情况", "税费口径"],
+      "enum_options": [
+        {"value": "true", "aliases": ["含税"]},
+        {"value": "false", "aliases": ["不含税"]}
+      ]
+    }
+  ]
+}

@@ -1,0 +1,14 @@
+{
+  "layout": "free",
+  "surface_variety": 0.7,
+  "distractors_per_key": 2,
+  "missing_rate": 0.2,
+  "duplicate_rate": 0.3,
+  "conflict_rate": 0.0,
+  "filler_blocks": 12,
+  "cross_block_rate": 0.3,
+  "table_style": "multi_row_header",
+  "hidden_row_rate": 0.2,
+  "derived_rate": 0.0,
+  "noise_rate": 0.25
+}
