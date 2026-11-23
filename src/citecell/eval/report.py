@@ -40,6 +40,49 @@ def ordered_reports(reports: Sequence[EvalReport]) -> list[EvalReport]:
     )
 
 
+LOC_BASIS = "value"
+LOC_BASIS_TEXT = "值区间（PDF 用解析片段还原；DOCX 用值字符区间；XLSX 用单元格）"
+
+
+def _localization(report: EvalReport) -> dict[str, int] | None:
+    """定位口径的计数，取自 all 切片的指标；回退必须显式计数，不得静默。"""
+    for s in report.slices:
+        if s.slice_name != "all":
+            continue
+        by = {m.name: m for m in s.metrics}
+        acc = by.get("localization_accuracy")
+        val = by.get("localization_value_basis")
+        fb = by.get("localization_quote_fallback")
+        if acc is None or val is None or fb is None:
+            return None
+        return {
+            "judged_records": acc.denominator,
+            "value_basis_records": val.numerator,
+            "quote_fallback_records": fb.numerator,
+        }
+    return None
+
+
+def _anchor(report: EvalReport) -> dict[str, int] | None:
+    """证据锚定（支持 / 干扰项）口径的计数，取自 all 切片。第三类（既非支持也非干扰）显式输出。"""
+    for s in report.slices:
+        if s.slice_name != "all":
+            continue
+        by = {m.name: m for m in s.metrics}
+        val = by.get("anchor_value_basis")
+        fb = by.get("anchor_quote_fallback")
+        un = by.get("evidence_unanchored_rate")
+        if val is None or fb is None or un is None:
+            return None
+        return {
+            "judged_records": val.denominator,
+            "value_basis_records": val.numerator,
+            "quote_fallback_records": fb.numerator,
+            "unanchored_records": un.numerator,
+        }
+    return None
+
+
 def _fmt_value(m: MetricValue) -> str:
     return NO_DATA if m.value is None else f"{m.value:.4f}"
 
@@ -106,6 +149,21 @@ def render_markdown(reports: Sequence[EvalReport]) -> str:
             lines.append(f"- run_id：`{report.run_id}`")
             lines.append(f"- 评测器版本：`{report.evaluator_version}`")
             lines.append(f"- 文档数：{report.n_documents}（指针集跳过：{report.n_documents_missing}）")
+            loc = _localization(report)
+            if loc is not None:
+                lines.append(f"- 定位口径：{LOC_BASIS_TEXT}")
+                lines.append(
+                    f"- 定位口径计数：正确记录 {loc['judged_records']} 条，其中值口径 "
+                    f"{loc['value_basis_records']} 条；回退引文口径 {loc['quote_fallback_records']} 条"
+                )
+            anc = _anchor(report)
+            if anc is not None:
+                lines.append(f"- 证据锚定口径：{LOC_BASIS_TEXT}")
+                lines.append(
+                    f"- 证据锚定计数：有值区间证据的记录 {anc['judged_records']} 条，其中值口径 "
+                    f"{anc['value_basis_records']} 条；回退引文口径 {anc['quote_fallback_records']} 条；"
+                    f"既非支持也非干扰 {anc['unanchored_records']} 条"
+                )
             lines.append(f"- 生成时间：{report.created_at.isoformat()}")
             lines.append("")
             for s in report.slices:
@@ -139,6 +197,8 @@ def render_json(reports: Sequence[EvalReport]) -> str:
                 "source": _source_of(r),
                 "report": r.model_dump(mode="json"),
                 "ci95": _ci_payload(r),
+                "localization": {"basis": LOC_BASIS, **(_localization(r) or {})},
+                "anchor": {"basis": LOC_BASIS, **(_anchor(r) or {})},
             }
             for r in ordered_reports(reports)
         ],

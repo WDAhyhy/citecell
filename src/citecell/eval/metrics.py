@@ -29,9 +29,15 @@ from collections.abc import Iterable, Mapping, Sequence
 from datetime import UTC, datetime
 
 from citecell.eval.align import AlignedRecord, align
-from citecell.eval.geometry import evidence_hits_mention
+from citecell.eval.geometry import (
+    BASIS_QUOTE,
+    BASIS_VALUE,
+    localization_basis,
+    localization_hit,
+)
 from citecell.models import (
     AttemptOutcome,
+    Block,
     DistributionStat,
     DocumentResult,
     EvalReport,
@@ -110,14 +116,13 @@ def _is_correct(pair: AlignedRecord) -> bool:
     return _normalizer.equivalent(pv, gv, pair.spec)
 
 
-def _hits_any_mention(
-    evs: Sequence[Evidence], mentions: Sequence[GoldMention], iou_threshold: float
-) -> bool:
-    return any(evidence_hits_mention(e, m, iou_threshold=iou_threshold) for e in evs for m in mentions)
-
-
-def _slice_metrics(pairs: Sequence[AlignedRecord], iou_threshold: float) -> list[MetricValue]:
+def _slice_metrics(
+    pairs: Sequence[AlignedRecord],
+    iou_threshold: float,
+    blocks: Mapping[str, Mapping[str, Block]],
+) -> list[MetricValue]:
     tp = fp = fn = 0
+    loc_value = loc_fallback = 0
     present = absent = 0
     grounded = grounded_wrong = 0
     absent_hallucinated = 0
@@ -128,6 +133,8 @@ def _slice_metrics(pairs: Sequence[AlignedRecord], iou_threshold: float) -> list
     loc_num = loc_den = 0
     sup_num = sup_den = 0
     dis_num = dis_den = 0
+    unanchored = 0
+    anchor_quote = anchor_value = 0
 
     for pair in pairs:
         pred: ExtractionRecord = pair.pred
@@ -173,17 +180,58 @@ def _slice_metrics(pairs: Sequence[AlignedRecord], iou_threshold: float) -> list
 
         if correct:
             loc_den += 1
-            if _hits_any_mention(pred.evidence, pair.gold.mentions, iou_threshold):
+            hit = False
+            any_quote = False
+            all_value = True
+            for e in pred.evidence:
+                if e.locator is None:
+                    continue
+                block = blocks.get(e.doc_id, {}).get(e.block_id)
+                basis = localization_basis(e, block)
+                if basis == BASIS_QUOTE:
+                    any_quote = True
+                if basis != BASIS_VALUE:
+                    all_value = False
+                for m in pair.gold.mentions:
+                    ok, _ = localization_hit(e, m, block=block, iou_threshold=iou_threshold)
+                    if ok:
+                        hit = True
+            if hit:
                 loc_num += 1
+            if any_quote:
+                loc_fallback += 1
+            if all_value:
+                loc_value += 1
 
         value_ev = [e for e in pred.evidence if e.value_char_start is not None]
         if value_ev:
+            # 证据锚定：值口径判定落在提及 / 干扰项上（与定位准确率同一几何规则）
             sup_den += 1
-            if _hits_any_mention(value_ev, pair.gold.mentions, iou_threshold):
-                sup_num += 1
             dis_den += 1
-            if _hits_any_mention(value_ev, pair.gold.distractors, iou_threshold):
+            supported = distracted = False
+            any_quote = False
+            all_value = True
+            for e in value_ev:
+                block = blocks.get(e.doc_id, {}).get(e.block_id)
+                basis = localization_basis(e, block)
+                if basis == BASIS_QUOTE:
+                    any_quote = True
+                if basis != BASIS_VALUE:
+                    all_value = False
+                for m in pair.gold.mentions:
+                    supported = localization_hit(e, m, block=block, iou_threshold=iou_threshold)[0] or supported
+                for d in pair.gold.distractors:
+                    distracted = localization_hit(e, d, block=block, iou_threshold=iou_threshold)[0] or distracted
+            if supported:
+                sup_num += 1
+            if distracted:
                 dis_num += 1
+            if not supported and not distracted:
+                unanchored += 1
+            if any_quote:
+                anchor_quote += 1
+            if all_value:
+                anchor_value += 1
 
     n = len(pairs)
     return [
@@ -194,8 +242,13 @@ def _slice_metrics(pairs: Sequence[AlignedRecord], iou_threshold: float) -> list
         _ratio("text_char_f1_micro", text_num, text_den),
         _ratio("citation_validity_final", ev_located, ev_total),
         _ratio("localization_accuracy", loc_num, loc_den),
+        _ratio("localization_value_basis", loc_value, loc_den),
+        _ratio("localization_quote_fallback", loc_fallback, loc_den),
         _ratio("evidence_support_rate", sup_num, sup_den),
         _ratio("distractor_hit_rate", dis_num, dis_den),
+        _ratio("evidence_unanchored_rate", unanchored, sup_den),
+        _ratio("anchor_value_basis", anchor_value, sup_den),
+        _ratio("anchor_quote_fallback", anchor_quote, sup_den),
         _ratio("silent_error_rate", grounded_wrong, grounded),
         _ratio("hallucination_rate_absent", absent_hallucinated, absent),
         _ratio("missed_present_rate", present_missed, present),
@@ -252,8 +305,17 @@ def _efficiency(docs: Sequence[DocumentResult]) -> tuple[list[MetricValue], list
     return metrics, dists
 
 
-def _slice(name: str, pairs: Sequence[AlignedRecord], iou_threshold: float) -> EvalSlice:
-    return EvalSlice(slice_name=name, n_records=len(pairs), metrics=_slice_metrics(pairs, iou_threshold))
+def _slice(
+    name: str,
+    pairs: Sequence[AlignedRecord],
+    iou_threshold: float,
+    blocks: Mapping[str, Mapping[str, Block]],
+) -> EvalSlice:
+    return EvalSlice(
+        slice_name=name,
+        n_records=len(pairs),
+        metrics=_slice_metrics(pairs, iou_threshold, blocks),
+    )
 
 
 def build_slices(
@@ -262,8 +324,10 @@ def build_slices(
     *,
     iou_threshold: float,
     injections: Sequence[InjectedError] = (),
+    blocks: Mapping[str, Mapping[str, Block]] | None = None,
 ) -> list[EvalSlice]:
-    all_metrics = _slice_metrics(pairs, iou_threshold)
+    blocks = blocks or {}
+    all_metrics = _slice_metrics(pairs, iou_threshold, blocks)
     records_by_cell = {(p.doc_sha256[:16], p.key): p.pred for p in pairs}
     aligned_by_id = {dr.info.doc_id: dr for dr in docs}
     eff_metrics, eff_dists = _efficiency(docs)
@@ -281,13 +345,13 @@ def build_slices(
     ]
     for t in sorted({p.spec.value_type.value for p in pairs}):
         subset = [p for p in pairs if p.spec.value_type.value == t]
-        slices.append(_slice(f"type={t}", subset, iou_threshold))
+        slices.append(_slice(f"type={t}", subset, iou_threshold, blocks))
     for f in sorted({p.doc_format.value for p in pairs}):
         subset = [p for p in pairs if p.doc_format.value == f]
-        slices.append(_slice(f"format={f}", subset, iou_threshold))
+        slices.append(_slice(f"format={f}", subset, iou_threshold, blocks))
     for tag in sorted({t for p in pairs for t in p.gold.tags}):
         subset = [p for p in pairs if tag in p.gold.tags]
-        slices.append(_slice(f"tag={tag}", subset, iou_threshold))
+        slices.append(_slice(f"tag={tag}", subset, iou_threshold, blocks))
     return slices
 
 
@@ -303,7 +367,13 @@ class CiteCellEvaluator:
 
     一次调用只能处理**一种**数据来源（ADR-014）：金标准必须全部为同一 DataSource，
     且 ``dataset_id`` 必须以 ``<source>:`` 开头（如 ``synthetic:procurement-v1``）。
-    ``parsed`` 参数为协议保留；M1 的证据定位已由流水线写入 ``Evidence.locator``，故未使用。
+
+    ``evaluate(result, gold, *, parsed, injections)`` 的调用约定：
+    * ``parsed``：``{doc_id: ParsedDocument}``，doc_id 为 16 位十六进制（== ``info.doc_id``），
+      须与 ``result`` 中证据所引用的文档对应。PDF 定位的值口径依赖它（块的逐字符片段）。
+      不传或缺某文档时，该文档的 PDF 证据回退到引文口径，并在报告中计数（``localization_quote_fallback``）。
+      键与 ``info.doc_id`` 不一致 → ``ValueError``。
+    * ``injections``：可选，见 ``build_slices``。
     """
 
     version: str = EVALUATOR_VERSION
@@ -333,6 +403,10 @@ class CiteCellEvaluator:
         parsed: Mapping[str, ParsedDocument] | None = None,
         injections: Sequence[InjectedError] = (),
     ) -> EvalReport:
+        for doc_id, pd in (parsed or {}).items():
+            if pd.info.doc_id != doc_id:
+                raise ValueError("parsed 的键必须是对应文档的 doc_id")
+        blocks = {doc_id: pd.block_map() for doc_id, pd in (parsed or {}).items()}
         if not gold:
             raise ValueError("金标准为空，无法评测")
         sources = {g.source for g in gold}
@@ -348,6 +422,7 @@ class CiteCellEvaluator:
             al.docs,
             iou_threshold=self._iou,
             injections=injections,
+            blocks=blocks,
         )
         logger.info("评测完成：%d 份文档，%d 条记录", len(al.docs), len(al.records))
         return EvalReport(

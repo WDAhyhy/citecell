@@ -10,7 +10,14 @@
 
 from __future__ import annotations
 
-from citecell.models import BBox, DocxLocator, Evidence, GoldMention, PdfLocator, XlsxLocator
+from citecell.models import BBox, Block, DocxLocator, Evidence, GoldMention, PdfLocator, XlsxLocator
+
+BASIS_VALUE = "value"
+"""值口径：PDF 用值区间还原的框；DOCX 用值字符区间；XLSX 为单元格（单元格即值）。"""
+BASIS_QUOTE = "quote"
+"""引文口径（回退）：PDF 用整段引文区域；DOCX 用引文字符区间。"""
+BASIS_NONE = "none"
+"""证据无定位，不适用。"""
 
 
 def iou(a: BBox, b: BBox) -> float:
@@ -35,6 +42,84 @@ def pdf_hit(pred: PdfLocator, gold: PdfLocator, *, iou_threshold: float) -> bool
     if pred.page_number != gold.page_number:
         return False
     return any(iou(p, g) >= iou_threshold for p in pred.regions for g in gold.regions)
+
+
+def _union(a: BBox, b: BBox) -> BBox:
+    return BBox(x0=min(a.x0, b.x0), y0=min(a.y0, b.y0), x1=max(a.x1, b.x1), y1=max(a.y1, b.y1))
+
+
+def value_regions(block: Block, vstart: int, vend: int) -> list[tuple[int, BBox]] | None:
+    """由解析块的逐字符片段还原值区间的框：与 [vstart, vend) 相交的片段按（页, 行）合并为一个框。
+
+    返回按（页, 行）排序的 ``(page_number, bbox)`` 列表；没有相交片段（含块无片段）时返回 None，
+    调用方据此回退到引文口径。片段精度为 span/line 时，框会覆盖整个 span（比值宽），这是已知局限。
+    """
+    frags = [f for f in block.fragments if f.start < vend and f.end > vstart]
+    if not frags:
+        return None
+    groups: dict[tuple[int, int], BBox] = {}
+    for f in sorted(frags, key=lambda f: (f.page_number, f.line, f.start)):
+        key = (f.page_number, f.line)
+        groups[key] = f.bbox if key not in groups else _union(groups[key], f.bbox)
+    return [(page, groups[(page, line)]) for page, line in sorted(groups)]
+
+
+def pdf_value_hit(regions: list[tuple[int, BBox]], gold: PdfLocator, *, iou_threshold: float) -> bool:
+    """值区间框命中：与金标准提及同页，且某一对框的 IoU 不低于阈值。"""
+    return any(
+        page == gold.page_number and iou(box, g) >= iou_threshold
+        for page, box in regions
+        for g in gold.regions
+    )
+
+
+def localization_basis(ev: Evidence, block: Block | None) -> str:
+    """定位口径：PDF 有值区间且块有相交片段 → value，否则 quote；DOCX 有值区间 → value，否则 quote；
+    XLSX → value（单元格）；无定位 → none。"""
+    loc = ev.locator
+    if loc is None:
+        return BASIS_NONE
+    if isinstance(loc, XlsxLocator):
+        return BASIS_VALUE
+    if ev.value_char_start is None or ev.value_char_end is None:
+        return BASIS_QUOTE
+    if isinstance(loc, PdfLocator):
+        if block is not None and value_regions(block, ev.value_char_start, ev.value_char_end) is not None:
+            return BASIS_VALUE
+        return BASIS_QUOTE
+    return BASIS_VALUE
+
+
+def localization_hit(
+    ev: Evidence, mention: GoldMention, *, block: Block | None, iou_threshold: float
+) -> tuple[bool, str]:
+    """定位命中（ARCH §9「定位准确率」）。返回 (是否命中, 实际使用的口径)。
+
+    * PDF 值口径：值区间框与金标准框同页且 IoU ≥ 阈值；回退（无块/无值区间/无片段）：引文区域框。
+    * DOCX：同段落或单元格；值口径为值字符区间与金标准字符区间相交，无值区间时回退为引文字符区间。
+    * XLSX：同单元格。
+    """
+    basis = localization_basis(ev, block)
+    pl = ev.locator
+    gl = mention.locator
+    if pl is None or pl.format != gl.format:
+        return False, basis
+    if isinstance(pl, PdfLocator) and isinstance(gl, PdfLocator):
+        if basis == BASIS_VALUE and block is not None:
+            regions = value_regions(block, ev.value_char_start, ev.value_char_end)  # type: ignore[arg-type]
+            assert regions is not None
+            return pdf_value_hit(regions, gl, iou_threshold=iou_threshold), basis
+        return pdf_hit(pl, gl, iou_threshold=iou_threshold), basis
+    if isinstance(pl, DocxLocator) and isinstance(gl, DocxLocator):
+        if docx_container(pl) != docx_container(gl):
+            return False, basis
+        if basis == BASIS_VALUE:
+            return _char_intersect(ev.value_char_start, ev.value_char_end, mention.char_start, mention.char_end), basis
+        return _char_intersect(ev.char_start, ev.char_end, mention.char_start, mention.char_end), basis
+    if isinstance(pl, XlsxLocator) and isinstance(gl, XlsxLocator):
+        same = (pl.sheet_name, pl.row_number, pl.column_number) == (gl.sheet_name, gl.row_number, gl.column_number)
+        return same, basis
+    return False, basis
 
 
 def docx_container(loc: DocxLocator) -> tuple[object, ...]:
