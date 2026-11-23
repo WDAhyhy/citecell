@@ -144,6 +144,8 @@ class BlockFlag(StrEnum):
     """DOCX 嵌套表格被按行优先拼接进外层单元格文本。"""
     SPLIT_FROM_LONG_BLOCK = "split_from_long_block"
     """超长段落按句切分得到的子块。"""
+    CONTINUED_ON_NEXT_PAGE = "continued_on_next_page"
+    """PDF：本块是页内最后一个块，且判断其所属段落在下一页继续。Verifier 做相邻拼接修复时可据此优先拼接下一页的第一个块。"""
 
 
 class LocatorPrecision(StrEnum):
