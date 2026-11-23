@@ -8,4 +8,4 @@ from citecell.models import CONTRACT_VERSION
 
 __all__ = ["CONTRACT_VERSION", "__version__"]
 
-__version__ = "0.0.1"
+__version__ = "0.1.0"
